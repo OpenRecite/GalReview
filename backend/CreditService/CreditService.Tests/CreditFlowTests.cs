@@ -12,4 +12,17 @@ public sealed class CreditFlowTests
     [Fact] public async Task Reservation_holds_and_settles_actual(){var repo=new MemoryCreditRepository();var h=new CreditHandlers(repo);var user=Guid.NewGuid();await h.Handle(new ProvisionAccountCommand(user),default);var op=Guid.NewGuid();await h.Handle(new ReserveCreditsCommand(user,op,"GAME_GENERATION",60_000),default);var held=await h.Handle(new GetBalanceQuery(user),default);Assert.Equal(.4m,held.Available);await h.Handle(new SettleCreditsCommand(op,25_000),default);var settled=await h.Handle(new GetBalanceQuery(user),default);Assert.Equal(.75m,settled.Balance);Assert.Equal(.75m,settled.Available);}
     [Fact] public async Task Insufficient_balance_returns_purchase_details(){var repo=new MemoryCreditRepository();var h=new CreditHandlers(repo);var user=Guid.NewGuid();await h.Handle(new ProvisionAccountCommand(user),default);var ex=await Assert.ThrowsAsync<CreditDomainException>(()=>h.Handle(new ReserveCreditsCommand(user,Guid.NewGuid(),"GAME_GENERATION",100_001),default));Assert.Equal("CREDITS_INSUFFICIENT",ex.Code);Assert.Equal(402,ex.StatusCode);}
     [Fact] public async Task Released_reservation_restores_available_balance(){var repo=new MemoryCreditRepository();var h=new CreditHandlers(repo);var user=Guid.NewGuid();await h.Handle(new ProvisionAccountCommand(user),default);var op=Guid.NewGuid();await h.Handle(new ReserveCreditsCommand(user,op,"PRACTICE_GENERATION",30_000),default);await h.Handle(new ReleaseCreditsCommand(op),default);Assert.Equal(1m,(await h.Handle(new GetBalanceQuery(user),default)).Available);}
+    [Fact] public async Task Batch_balance_lookup_provisions_and_dedupes()
+    {
+        var repo = new MemoryCreditRepository();
+        var h = new CreditHandlers(repo);
+        var a = Guid.NewGuid();
+        var b = Guid.NewGuid();
+        var balances = await h.Handle(new GetBalancesQuery([a, b, a]), default);
+        Assert.Equal(2, balances.Count);
+        Assert.All(balances, x => Assert.Equal(1m, x.Balance));
+        Assert.Contains(balances, x => x.UserId == a);
+        Assert.Contains(balances, x => x.UserId == b);
+        Assert.Empty(await h.Handle(new GetBalancesQuery([]), default));
+    }
 }

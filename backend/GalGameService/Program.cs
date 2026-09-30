@@ -1,6 +1,4 @@
 using System.Text.Json.Serialization;
-using Microsoft.AspNetCore.Diagnostics;
-using Microsoft.AspNetCore.Mvc;
 
 // ============================================================================
 // GalGameService — 游戏生成任务、游戏包与 schema（F15EX 负责）
@@ -14,8 +12,7 @@ using Microsoft.AspNetCore.Mvc;
 // ============================================================================
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Logging.ClearProviders();
-builder.Logging.AddConsole();
+builder.Logging.AddJsonStructuredLogging();
 
 builder.Services.Configure<Microsoft.AspNetCore.Routing.RouteHandlerOptions>(
     options => options.ThrowOnBadRequest = true);
@@ -29,6 +26,8 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 
 var gatewayKey = builder.Configuration["Gateway:ServiceKey"]
     ?? throw new InvalidOperationException("Gateway:ServiceKey must be configured.");
+if (builder.Environment.IsProduction() && string.Equals(gatewayKey, "moonstone-local-gateway-key", StringComparison.Ordinal))
+    throw new InvalidOperationException("Gateway:ServiceKey must be changed from the development default in production.");
 var isMockMode = string.Equals(
     builder.Configuration["MOONSTONE_MODE"] ?? Environment.GetEnvironmentVariable("MOONSTONE_MODE"),
     "Mock", StringComparison.OrdinalIgnoreCase);
@@ -134,6 +133,8 @@ builder.Services.AddSingleton<PlanGraphClient>(sp => new PlanGraphClient(
     sp.GetRequiredService<IConfiguration>(),
     isMockMode));
 builder.Services.AddSingleton<GameGenerator>();
+builder.Services.AddSingleton<GameGenerationQueue>();
+builder.Services.AddHostedService<GameGenerationWorker>();
 
 var app = builder.Build();
 
@@ -165,100 +166,14 @@ else if (voiceEnabled)
         Math.Clamp(voiceOptions.MaxConcurrency, 1, 6));
 }
 
-// ============================================================================
-// 启动恢复：将因服务重启而卡在 RUNNING/QUEUED 的生成任务标记为 FAILED
-// ============================================================================
-if (useMongoStore)
-{
-    try
-    {
-        var store = app.Services.GetRequiredService<IGameStore>();
-        var recovered = store.RecoverStaleJobs();
-        if (recovered > 0)
-        {
-            var startupLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("GalGameService");
-            startupLogger.LogWarning("Startup recovery: {Count} stale job(s) marked as FAILED", recovered);
-        }
-    }
-    catch (Exception ex)
-    {
-        var startupLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("GalGameService");
-        startupLogger.LogWarning(ex, "Startup recovery failed; stale jobs may remain in RUNNING/QUEUED state");
-    }
-}
+await GalGameStartupRecovery.RecoverStaleJobsAsync(app, useMongoStore);
 
-// ============================================================================
-// 中间件
-// ============================================================================
-
-// X-Correlation-Id：校验格式并截断长度，防止头注入和日志注入
-app.Use(async (context, next) =>
-{
-    const int MaxCorrelationIdLength = 64;
-    var rawCorrelationId = context.Request.Headers["X-Correlation-Id"].FirstOrDefault();
-
-    string correlationId;
-    if (!string.IsNullOrWhiteSpace(rawCorrelationId)
-        && rawCorrelationId.Length <= MaxCorrelationIdLength
-        && rawCorrelationId.All(c => char.IsLetterOrDigit(c) || c == '-' || c == '_'))
-    {
-        correlationId = rawCorrelationId;
-    }
-    else
-    {
-        correlationId = Guid.NewGuid().ToString("N");
-    }
-
-    context.TraceIdentifier = correlationId;
-    context.Response.Headers["X-Correlation-Id"] = correlationId;
-    await next();
-});
-
-// 异常处理
-app.UseExceptionHandler(error => error.Run(context =>
-{
-    var exception = context.Features.Get<IExceptionHandlerFeature>()?.Error;
-    var logger = context.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("GalGameService");
-
-    if (exception is UpstreamContractException)
-    {
-        logger.LogError(exception, "KnowledgeService returned an invalid contract. CorrelationId: {CorrelationId}; Path: {Path}",
-            context.TraceIdentifier, context.Request.Path);
-        return Results.Json(
-            ApiFailure.Create("UPSTREAM_CONTRACT_INVALID", "知识图谱服务响应不符合契约", context.TraceIdentifier),
-            statusCode: StatusCodes.Status502BadGateway).ExecuteAsync(context);
-    }
-    if (exception is BadHttpRequestException or System.Text.Json.JsonException)
-    {
-        logger.LogWarning(exception, "Invalid GalGameService request. CorrelationId: {CorrelationId}; Path: {Path}",
-            context.TraceIdentifier, context.Request.Path);
-        return Results.Json(
-            ApiFailure.Create("VALIDATION_ERROR", "请求 JSON、参数或字段格式错误", context.TraceIdentifier),
-            statusCode: StatusCodes.Status400BadRequest).ExecuteAsync(context);
-    }
-    logger.LogError(exception, "Unhandled GalGameService error. CorrelationId: {CorrelationId}; Path: {Path}",
-        context.TraceIdentifier, context.Request.Path);
-    // 未预期异常不向调用方泄露内部实现细节；对外统一为可重试的上游不可用。
-    return Results.Json(
-        ApiFailure.Create("SERVICE_UNAVAILABLE", "游戏生成服务暂时不可用", context.TraceIdentifier),
-        statusCode: StatusCodes.Status503ServiceUnavailable).ExecuteAsync(context);
-}));
-
-// Gateway 密钥验证（/healthz、/readyz 豁免）
-app.Use(async (context, next) =>
-{
-    if (context.Request.Path == "/healthz" || context.Request.Path == "/readyz")
-    {
-        await next();
-        return;
-    }
-    if (!IsGateway(context, gatewayKey))
-    {
-        await Failure(context, 403, "FORBIDDEN", "该服务仅接受经 API Gateway 转发的请求").ExecuteAsync(context);
-        return;
-    }
-    await next();
-});
+app.UseGalGameCorrelationId();
+app.UseRequestLogging("GalGameService", normalizeCorrelationId: false);
+// 出站透传：CreditBillingClient 等读 GalGameTraceFlow.Current
+RequestLogging.BeginAmbientTrace = GalGameTraceFlow.Begin;
+app.UseGalGameExceptionHandler();
+app.UseGalGameGatewayKey(gatewayKey);
 
 // ============================================================================
 // 健康检查
@@ -284,423 +199,13 @@ app.MapGet("/readyz", (HttpContext c, IGameStore store) =>
     }, c.TraceIdentifier));
 });
 
-// ============================================================================
-// 端点 1：POST /api/v1/game-generations — 创建游戏包生成任务
-// 契约 §7.3.1 URGENT：同步经 Gateway 读取 PlanGraph 并校验 snapshotVersion。
-//   - snapshot 不匹配 → 422 REVIEW_PLAN_SNAPSHOT_MISMATCH
-//   - reviewPlan 不存在 → 422 REVIEW_PLAN_NOT_FOUND
-//   - 上游不可用 → 503 SERVICE_UNAVAILABLE
-//   - 校验通过 → 202 Accepted，后台异步生成
-// ============================================================================
+// 端点 1-2：生成任务创建 / 查询（GameGenerationEndpoints）
+app.MapGameGenerationEndpoints(gatewayKey, isMockMode, narrativeEnabled, narrativeOptions);
 
-app.MapPost("/api/v1/game-generations", async (GameGenerationRequest request, HttpContext c, IGameStore store, PlanGraphClient planClient, NarrativeGenerationService narrativeService, PackageVoiceService voiceService, IGameCreditBilling billing) =>
-{
-    var userId = GatewayUser(c, gatewayKey);
-    if (userId is null) return Failure(c, 401, "AUTH_REQUIRED", "需要网关认证的用户身份。");
-
-    // 请求验证
-    if (!IsUuidV4(request.ReviewPlanId))
-        return Failure(c, 400, "VALIDATION_ERROR", "reviewPlanId 必须为 UUID v4。");
-    if (string.IsNullOrWhiteSpace(request.SnapshotVersion))
-        return Failure(c, 400, "VALIDATION_ERROR", "snapshotVersion 不能为空。");
-    if (string.IsNullOrWhiteSpace(request.Locale))
-        return Failure(c, 400, "VALIDATION_ERROR", "locale 不能为空。");
-
-    var traceId = c.TraceIdentifier;
-    var logger = c.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("GalGameService.Generation");
-    if (!Guid.TryParse(userId, out var ownerUserId))
-        return Failure(c, 401, "AUTH_REQUIRED", "用户身份格式无效。");
-
-    // §7.3.1 URGENT：同步经 Gateway 读取不可变 PlanGraph，校验 snapshotVersion
-    PlanGraphFetchResult fetchResult;
-    try
-    {
-        fetchResult = await planClient.GetGraphAsync(
-            request.ReviewPlanId, request.SnapshotVersion, traceId, c.RequestAborted, mockOwnerUserId: ownerUserId);
-    }
-
-    catch (OperationCanceledException) when (c.RequestAborted.IsCancellationRequested)
-    {
-        return Failure(c, 499, "CLIENT_CLOSED_REQUEST", "客户端断开连接");
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "Unable to read PlanGraph. CorrelationId: {CorrelationId}; ReviewPlanId: {ReviewPlanId}",
-            traceId, request.ReviewPlanId);
-        return Failure(c, 503, "SERVICE_UNAVAILABLE", "知识图谱服务暂时不可用");
-    }
-
-    if (fetchResult.Status == PlanGraphFetchStatus.SnapshotMismatch)
-        return Failure(c, 422, "REVIEW_PLAN_SNAPSHOT_MISMATCH", fetchResult.Detail ?? "snapshot 不匹配");
-    if (fetchResult.Status == PlanGraphFetchStatus.NotFound)
-        return Failure(c, 422, "REVIEW_PLAN_NOT_FOUND", fetchResult.Detail ?? "复习计划不存在");
-    if (fetchResult.Status == PlanGraphFetchStatus.InvalidRequest)
-        return Failure(c, 400, "VALIDATION_ERROR", fetchResult.Detail ?? "复习计划图请求不符合契约");
-    if (fetchResult.Status == PlanGraphFetchStatus.UpstreamContractInvalid)
-        throw new UpstreamContractException(fetchResult.Detail ?? "KnowledgeService 响应不符合契约");
-    if (fetchResult.Status == PlanGraphFetchStatus.Unavailable)
-        return Failure(c, 503, "SERVICE_UNAVAILABLE", fetchResult.Detail ?? "知识图谱服务不可用");
-    if (fetchResult.Status != PlanGraphFetchStatus.Success || fetchResult.Graph is null)
-        throw new UpstreamContractException("PlanGraph 读取结果状态不完整");
-
-    var graph = fetchResult.Graph;
-    if (graph.OwnerUserId != ownerUserId)
-        return Failure(c, 422, "REVIEW_PLAN_NOT_FOUND", "复习计划不存在或不可用于当前用户。");
-
-    // PlanGraph 已校验且属于当前用户，创建生成任务
-    GameGenerationJob job;
-    try
-    {
-        job = store.CreateJob(userId, request);
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "Unable to create generation job. CorrelationId: {CorrelationId}; ReviewPlanId: {ReviewPlanId}",
-            traceId, request.ReviewPlanId);
-        return Failure(c, 503, "SERVICE_UNAVAILABLE", "游戏生成任务暂时不可用");
-    }
-
-    var estimatedUnits = narrativeEnabled
-        ? Math.Max(1L,
-            ((graph.Nodes ?? []).Sum(node => (long)((node.Title?.Length ?? 0) + (node.Summary?.Length ?? 0))) / 2L
-                + 2_048L
-                + Math.Clamp(narrativeOptions.MaxOutputTokens, 1_000, 32_000))
-            * Math.Clamp(narrativeOptions.MaxDraftAttempts, 1, 3)
-            * Math.Clamp(narrativeOptions.MaxProviderAttempts, 1, 4))
-        : 1L;
-    try
-    {
-        await billing.ReserveAsync(ownerUserId, job.GenerationId, estimatedUnits, c.RequestAborted);
-    }
-    catch (CreditBillingException credit)
-    {
-        // 上游 details 由 System.Text.Json 解析为 JsonElement；MongoDB 的安全 ObjectSerializer
-        // 不接受该运行时类型。任务仅持久化稳定的错误码与消息，即时响应仍完整返回购买信息。
-        store.TryTransitionJob(job.GenerationId, JobStatus.QUEUED, j => j with { Status = JobStatus.FAILED, Error = new ApiError(credit.Code, credit.Message, new Dictionary<string, string>()) });
-        return Failure(c, credit.StatusCode, credit.Code, credit.Message, credit.Details);
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "Unable to reserve credits. CorrelationId: {CorrelationId}", traceId);
-        store.TryTransitionJob(job.GenerationId, JobStatus.QUEUED, j => j with { Status = JobStatus.FAILED, Error = new ApiError("SERVICE_UNAVAILABLE", "credits 服务暂时不可用", new Dictionary<string, string>()) });
-        return Failure(c, 503, "SERVICE_UNAVAILABLE", "credits 服务暂时不可用");
-    }
-
-    // 后台异步生成（PlanGraph 已确认可用，不再重复获取）
-    // 使用 _ = 丢弃 Task 但内部有完整异常处理，不会静默吞异常
-    _ = Task.Run(async () =>
-    {
-        var reservationSettled = false;
-        try
-        {
-            // 原子状态转换：QUEUED → RUNNING
-            if (store.TryTransitionJob(job.GenerationId, JobStatus.QUEUED,
-                j => j with { Status = JobStatus.RUNNING, Progress = 5 }) is null)
-            {
-                logger.LogWarning("Job {GenerationId} was not in QUEUED state, skipping generation", job.GenerationId);
-                return;
-            }
-
-            void ReportProgress(int progress)
-            {
-                try
-                {
-                    store.TryTransitionJob(job.GenerationId, JobStatus.RUNNING, current =>
-                        current.Progress >= progress ? current : current with { Progress = progress });
-                }
-                catch (Exception progressError)
-                {
-                    // 进度写入是观测信息，不应破坏已经在进行的剧情生成。
-                    logger.LogWarning(progressError,
-                        "Unable to persist progress {Progress} for job {GenerationId}",
-                        progress,
-                        job.GenerationId);
-                }
-            }
-
-            logger.LogInformation("Job {GenerationId} started generating. Style={Style}, Difficulty={Difficulty}",
-                job.GenerationId, request.Style, request.Difficulty);
-
-            // Mock 固定返回同一套原创演示剧情；仍保留请求的计划与快照字段，
-            // 使包的溯源、任务查询和权限边界继续符合 §7.1 / §7.3.1。
-            // 非 Mock 才执行真实的骨架生成与可选叙事模型重写。
-            GamePackage package;
-            long actualTokenUnits;
-            if (isMockMode)
-            {
-                package = MockStoryPackageFactory.Create(request);
-                actualTokenUnits = 0;
-                ReportProgress(85);
-            }
-            else
-            {
-                var generation = await narrativeService.GenerateAsync(
-                    graph,
-                    request,
-                    userId,
-                    ReportProgress);
-                package = generation.Package;
-                actualTokenUnits = generation.TotalTokens;
-            }
-
-            ReportProgress(86);
-            var voiceResult = await voiceService.SynthesizeAsync(
-                package,
-                ReportProgress);
-            package = voiceResult.Package;
-            ReportProgress(94);
-            var checksum = GamePackageValidator.ComputeChecksum(package);
-            ReportProgress(95);
-            var manifest = new GamePackageManifest(
-                package.PackageId, package.SchemaVersion, package.GeneratorVersion,
-                package.ReviewPlanId, package.SnapshotVersion, package.EntrySceneId,
-                package.Scenes.Length, checksum,
-                $"/api/v1/game-packages/{package.PackageId}/content",
-                userId, DateTimeOffset.UtcNow);
-
-            foreach (var audio in voiceResult.AudioAssets)
-                store.SaveAudio(audio);
-            store.SavePackage(package, manifest, userId);
-
-            // A failed persistence step must release the reservation instead of
-            // charging for a package that the user cannot retrieve.
-            await billing.SettleAsync(job.GenerationId, actualTokenUnits, CancellationToken.None);
-            reservationSettled = true;
-            ReportProgress(97);
-
-            // 原子状态转换：RUNNING → SUCCEEDED
-            store.TryTransitionJob(job.GenerationId, JobStatus.RUNNING,
-                j => j with { Status = JobStatus.SUCCEEDED, Progress = 100, PackageId = package.PackageId });
-
-            logger.LogInformation("Job {GenerationId} succeeded. PackageId={PackageId}, Scenes={SceneCount}",
-                job.GenerationId, package.PackageId, package.Scenes.Length);
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Job {GenerationId} failed during generation", job.GenerationId);
-            if (!reservationSettled)
-            {
-                try { await billing.ReleaseAsync(job.GenerationId, CancellationToken.None); }
-                catch (Exception releaseError) { logger.LogError(releaseError, "Unable to release credits for failed job {GenerationId}", job.GenerationId); }
-            }
-            store.TryTransitionJob(job.GenerationId, JobStatus.RUNNING,
-                j => j with { Status = JobStatus.FAILED, Error = new ApiError("INTERNAL_ERROR", "生成任务处理失败，请稍后重试或联系支持团队", new Dictionary<string, string>()) });
-        }
-    });
-
-    return Results.Accepted($"/api/v1/game-generations/{job.GenerationId}", ApiSuccess.Create(job, c.TraceIdentifier));
-});
-
-// ============================================================================
-// 端点 2：GET /api/v1/game-generations/{generationId} — 查询生成任务
-// ============================================================================
-
-app.MapGet("/api/v1/game-generations/{generationId}", (string generationId, HttpContext c, IGameStore store) =>
-{
-    var userId = GatewayUser(c, gatewayKey);
-    if (userId is null) return Failure(c, 401, "AUTH_REQUIRED", "需要网关认证的用户身份。");
-    if (!TryParseUuidV4(generationId, out var id))
-        return Failure(c, 400, "VALIDATION_ERROR", "generationId 必须为 UUID v4。");
-    var job = store.GetJob(id);
-    if (job is null || job.OwnerUserId != userId)
-        return Failure(c, 404, "RESOURCE_NOT_FOUND", "生成任务不存在。");
-    return Results.Ok(ApiSuccess.Create(job, c.TraceIdentifier));
-});
-
-// ============================================================================
-// 端点 3：GET /api/v1/game-packages/{packageId} — 读取游戏包清单
-// ============================================================================
-
-app.MapGet("/api/v1/game-packages/{packageId}", (string packageId, HttpContext c, IGameStore store) =>
-{
-    var userId = GatewayUser(c, gatewayKey);
-    if (userId is null) return Failure(c, 401, "AUTH_REQUIRED", "需要网关认证的用户身份。");
-    if (!TryParseUuidV4(packageId, out var id))
-        return Failure(c, 400, "VALIDATION_ERROR", "packageId 必须为 UUID v4。");
-    var manifest = store.GetManifest(id);
-    if (manifest is null || manifest.OwnerUserId != userId)
-        return Failure(c, 404, "RESOURCE_NOT_FOUND", "游戏包不存在。");
-    return Results.Ok(ApiSuccess.Create(manifest, c.TraceIdentifier));
-});
-
-// ============================================================================
-// 端点 4：GET /api/v1/game-packages/{packageId}/content — 下载完整 JSON 游戏包
-// 支持 ETag / 304 协商缓存 + Cache-Control 防止中间代理缓存私有内容
-// ============================================================================
-
-app.MapGet("/api/v1/game-packages/{packageId}/content", (string packageId, HttpContext c, IGameStore store) =>
-{
-    var userId = GatewayUser(c, gatewayKey);
-    if (userId is null) return Failure(c, 401, "AUTH_REQUIRED", "需要网关认证的用户身份。");
-    if (!TryParseUuidV4(packageId, out var id))
-        return Failure(c, 400, "VALIDATION_ERROR", "packageId 必须为 UUID v4。");
-
-    var owner = store.GetPackageOwner(id);
-    if (owner is null || owner != userId)
-        return Failure(c, 404, "RESOURCE_NOT_FOUND", "游戏包不存在。");
-
-    var manifest = store.GetManifest(id);
-    var package = store.GetPackage(id);
-    if (manifest is null || package is null)
-        return Failure(c, 404, "RESOURCE_NOT_FOUND", "游戏包不存在。");
-
-    // ETag / 304 协商缓存
-    var etag = $"\"{manifest.Checksum}\"";
-    c.Response.Headers.ETag = etag;
-    // 游戏包是用户私有的，禁止共享缓存
-    c.Response.Headers.CacheControl = "private, no-cache";
-    c.Response.Headers.XContentTypeOptions = "nosniff";
-    if (IfNoneMatchMatches(c.Request.Headers.IfNoneMatch, etag))
-        return Results.StatusCode(304);
-
-    return Results.Text(
-        GamePackageValidator.SerializeCanonical(package),
-        "application/json; charset=utf-8");
-});
-
-// Package-scoped MiMo dialogue audio. Authorization is identical to package content;
-// the browser downloads bytes with its bearer token and plays a local Blob URL.
-app.MapGet("/api/v1/game-packages/{packageId}/audio/{assetId}", (
-    string packageId,
-    string assetId,
-    HttpContext c,
-    IGameStore store) =>
-{
-    var userId = GatewayUser(c, gatewayKey);
-    if (userId is null)
-        return Failure(c, 401, "AUTH_REQUIRED", "需要网关认证的用户身份。");
-    if (!TryParseUuidV4(packageId, out var id)
-        || string.IsNullOrWhiteSpace(assetId)
-        || assetId.Length > 128)
-        return Failure(c, 400, "VALIDATION_ERROR", "packageId 或 assetId 格式无效。");
-
-    var owner = store.GetPackageOwner(id);
-    var package = store.GetPackage(id);
-    if (owner is null || package is null || owner != userId)
-        return Failure(c, 404, "RESOURCE_NOT_FOUND", "语音资源不存在。");
-
-    var expectedUri = $"/api/v1/game-packages/{id}/audio/{assetId}";
-    var referenced = (package.Assets ?? Array.Empty<AssetRef>()).Any(asset =>
-        asset is not null
-        && asset.Type == AssetType.AUDIO
-        && string.Equals(asset.AssetId, assetId, StringComparison.Ordinal)
-        && string.Equals(asset.Uri, expectedUri, StringComparison.Ordinal));
-    var audio = referenced ? store.GetAudio(id, assetId) : null;
-    if (audio is null)
-        return Failure(c, 404, "RESOURCE_NOT_FOUND", "语音资源不存在。");
-
-    c.Response.Headers.CacheControl = "private, max-age=31536000, immutable";
-    c.Response.Headers.XContentTypeOptions = "nosniff";
-    return Results.File(
-        audio.Data,
-        audio.ContentType,
-        enableRangeProcessing: true);
-});
-
-// ============================================================================
-// INTERNAL：RenderService 按当前会话用户读取权威游戏包。
-// ownerUserId 必须来自 RenderService 收到的 Gateway 可信 X-User-Id，不能取浏览器自报值。
-// ============================================================================
-
-app.MapGet("/internal/v1/game-packages/{packageId}", (
-    string packageId,
-    string? ownerUserId,
-    HttpContext c,
-    IGameStore store) =>
-{
-    if (!InternalServiceAccessPolicy.IsTrusted(
-            c.Request.Headers, gatewayKey, packageReaderAllowedServices))
-        return Failure(c, 403, "FORBIDDEN", "需要经 Gateway 转发的可信 RenderService 身份。");
-
-    if (!TryParseUuidV4(packageId, out var id)
-        || !TryParseUuidV4(ownerUserId, out _))
-        return Failure(c, 400, "VALIDATION_ERROR", "packageId 与 ownerUserId 必须为 UUID v4。");
-
-    var owner = store.GetPackageOwner(id);
-    var package = store.GetPackage(id);
-    if (owner is null || package is null
-        || !string.Equals(owner, ownerUserId, StringComparison.OrdinalIgnoreCase))
-        return Failure(c, 404, "RESOURCE_NOT_FOUND", "游戏包不存在。");
-
-    return Results.Ok(ApiSuccess.Create(package, c.TraceIdentifier));
-});
-
-// ============================================================================
-// 端点 5：POST /internal/v1/game-package-validations — 校验游戏包（服务间）
-// ============================================================================
-
-app.MapPost("/internal/v1/game-package-validations", (GamePackageValidationRequest request, HttpContext c, GamePackageValidator validator) =>
-{
-    // 服务身份验证：X-Gateway-Key + X-Service-Name
-    if (!InternalServiceAccessPolicy.IsTrusted(
-            c.Request.Headers, gatewayKey, validationAllowedServices))
-        return Failure(c, 403, "FORBIDDEN", "需要经 Gateway 转发的可信服务身份。");
-
-    if (request.Package is null)
-        return Failure(c, 400, "VALIDATION_ERROR", "package 不能为空。");
-
-    var result = validator.Validate(request.Package);
-    return Results.Json(
-        ApiSuccess.Create(result, c.TraceIdentifier),
-        statusCode: result.Valid ? StatusCodes.Status200OK : StatusCodes.Status422UnprocessableEntity);
-});
+// 端点 3-5：游戏包读取 / 音频 / INTERNAL 校验（已拆至 GamePackageEndpoints）
+app.MapGamePackageEndpoints(gatewayKey, packageReaderAllowedServices, validationAllowedServices);
 
 app.Run();
-
-// ============================================================================
-// 辅助函数
-// ============================================================================
-
-static bool IsGateway(HttpContext context, string key)
-    => context.Request.Headers.TryGetValue("X-Gateway-Key", out var values)
-       && values.Count == 1
-       && string.Equals(values[0], key, StringComparison.Ordinal);
-
-static string? GatewayUser(HttpContext context, string key)
-{
-    if (!context.Request.Headers.TryGetValue("X-Gateway-Key", out var gwValues)
-        || gwValues.Count != 1
-        || !string.Equals(gwValues[0], key, StringComparison.Ordinal))
-        return null;
-
-    if (!context.Request.Headers.TryGetValue("X-User-Id", out var userIdValues)
-        || userIdValues.Count != 1
-        || !TryParseUuidV4(userIdValues[0], out _))
-        return null;
-
-    return userIdValues[0];
-}
-
-static IResult Failure(HttpContext context, int status, string code, string message, object? details = null)
-    => Results.Json(new ApiFailure(null, new ApiError(code, message, details ?? new { }), context.TraceIdentifier), statusCode: status);
-
-static bool TryParseUuidV4(string? value, out Guid id)
-    => Guid.TryParse(value, out id) && IsUuidV4(id);
-
-static bool IsUuidV4(Guid id)
-{
-    if (id == Guid.Empty) return false;
-    var value = id.ToString("D");
-    return value[14] == '4' && value[19] is '8' or '9' or 'a' or 'b';
-}
-
-static bool IfNoneMatchMatches(Microsoft.Extensions.Primitives.StringValues values, string currentEtag)
-{
-    foreach (var rawValue in values)
-    {
-        if (rawValue is null) continue;
-        foreach (var rawTag in rawValue.Split(','))
-        {
-            var tag = rawTag.Trim();
-            if (tag == "*") return true;
-            if (tag.StartsWith("W/", StringComparison.OrdinalIgnoreCase))
-                tag = tag[2..].TrimStart();
-            if (string.Equals(tag, currentEtag, StringComparison.Ordinal))
-                return true;
-        }
-    }
-    return false;
-}
 
 // 暴露 partial class 供 WebApplicationFactory 集成测试使用
 public partial class Program { }

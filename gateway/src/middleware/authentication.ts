@@ -2,6 +2,7 @@ import type { Request, Response, NextFunction } from 'express';
 import type { GatewayConfig } from '../config.js';
 import type { TokenIntrospection } from '../types.js';
 import { buildApiFailure, getTraceId } from '../types.js';
+import { createIntrospectionCache, type IntrospectionCache } from './introspectionCache.js';
 
 /** 内省请求超时（毫秒），AuthService 挂起时不会拖死 Gateway */
 export const INTROSPECTION_TIMEOUT_MS = 5_000;
@@ -9,13 +10,13 @@ export const INTROSPECTION_TIMEOUT_MS = 5_000;
 /** Token 最大允许长度（字符），防止超长令牌造成出站带宽/AuthService DoS */
 const MAX_TOKEN_LENGTH = 8_192;
 
-type ActiveTokenIntrospection = TokenIntrospection & {
+export type ActiveTokenIntrospection = TokenIntrospection & {
   active: true;
   userId: string;
 };
 
 /** 内省结果：只有规范响应中的 active=false 能证明令牌无效 */
-type IntrospectionResult =
+export type IntrospectionResult =
   | { status: 'ok'; data: ActiveTokenIntrospection }
   | { status: 'invalid' }
   | { status: 'unreachable' };
@@ -164,7 +165,14 @@ async function introspectToken(
  * - 验证通过后注入 X-User-Id 到 req.gatewayUserId
  * - 验证失败返回 401
  */
-export function createAuthenticationMiddleware(config: GatewayConfig) {
+export function createAuthenticationMiddleware(
+  config: GatewayConfig,
+  introspectionCache: IntrospectionCache = createIntrospectionCache({
+    positiveTtlMs: config.introspectionCache.positiveTtlMs,
+    negativeTtlMs: config.introspectionCache.negativeTtlMs,
+    maxEntries: config.introspectionCache.maxEntries,
+  }),
+) {
   const authServiceUrl = config.services.authService.url;
   // 使用 AuthService 的独立密钥（如有），回退到全局 gatewayKey
   const gatewayKey = config.services.authService.serviceKey ?? config.gatewayKey;
@@ -189,11 +197,8 @@ export function createAuthenticationMiddleware(config: GatewayConfig) {
       return;
     }
 
-    const result = await introspectToken(
-      authServiceUrl,
-      gatewayKey,
-      token,
-      traceId,
+    const result = await introspectionCache.resolve(token, () =>
+      introspectToken(authServiceUrl, gatewayKey, token, traceId),
     );
 
     if (result.status === 'unreachable') {

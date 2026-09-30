@@ -6,6 +6,8 @@ namespace CreditService.Application;
 public interface ICreditRepository
 {
     CreditAccount Provision(Guid userId);
+    /// <summary>批量惰性开通并读取账户；缺失账户按初始额度创建。顺序与 userIds 一致。</summary>
+    IReadOnlyList<CreditAccount> ProvisionMany(IReadOnlyList<Guid> userIds);
     CreditAccount? GetAccount(Guid userId);
     void DeleteAccount(Guid userId);
     (CreditAccount Account, RedemptionCode Code) Redeem(Guid userId, string code);
@@ -28,6 +30,7 @@ public sealed record ReservationView(Guid OperationId, string OperationType, dec
 public sealed record ProvisionAccountCommand(Guid UserId) : IRequest<CreditBalance>;
 public sealed record DeleteAccountCommand(Guid UserId) : IRequest;
 public sealed record GetBalanceQuery(Guid UserId) : IRequest<CreditBalance>;
+public sealed record GetBalancesQuery(IReadOnlyList<Guid> UserIds) : IRequest<IReadOnlyList<CreditBalance>>;
 public sealed record RedeemCodeCommand(Guid UserId, string Code) : IRequest<CreditBalance>;
 public sealed record ListCodesQuery : IRequest<IReadOnlyList<RedemptionCodeView>>;
 public sealed record CreateCodeBatchCommand(Guid AdminUserId, int Count, decimal CreditsPerCode, DateTimeOffset? ExpiresAt) : IRequest<IReadOnlyList<RedemptionCodeView>>;
@@ -38,7 +41,8 @@ public sealed record ReleaseCreditsCommand(Guid OperationId) : IRequest<Reservat
 
 public sealed class CreditHandlers(ICreditRepository repository) :
     IRequestHandler<ProvisionAccountCommand, CreditBalance>, IRequestHandler<DeleteAccountCommand>,
-    IRequestHandler<GetBalanceQuery, CreditBalance>, IRequestHandler<RedeemCodeCommand, CreditBalance>,
+    IRequestHandler<GetBalanceQuery, CreditBalance>, IRequestHandler<GetBalancesQuery, IReadOnlyList<CreditBalance>>,
+    IRequestHandler<RedeemCodeCommand, CreditBalance>,
     IRequestHandler<ListCodesQuery, IReadOnlyList<RedemptionCodeView>>,
     IRequestHandler<CreateCodeBatchCommand, IReadOnlyList<RedemptionCodeView>>, IRequestHandler<RevokeCodeCommand>,
     IRequestHandler<ReserveCreditsCommand, ReservationView>, IRequestHandler<SettleCreditsCommand, ReservationView>,
@@ -49,6 +53,13 @@ public sealed class CreditHandlers(ICreditRepository repository) :
     // Provision is idempotent. Lazily provisioning here migrates users created
     // before CreditService was deployed without requiring a cross-database scan.
     public Task<CreditBalance> Handle(GetBalanceQuery request, CancellationToken ct) => Task.FromResult(CreditBalance.From(repository.Provision(request.UserId)));
+    public Task<IReadOnlyList<CreditBalance>> Handle(GetBalancesQuery request, CancellationToken ct)
+    {
+        var distinct = request.UserIds.Distinct().ToArray();
+        if (distinct.Length == 0) return Task.FromResult<IReadOnlyList<CreditBalance>>([]);
+        var accounts = repository.ProvisionMany(distinct);
+        return Task.FromResult<IReadOnlyList<CreditBalance>>(accounts.Select(CreditBalance.From).ToArray());
+    }
     public Task<CreditBalance> Handle(RedeemCodeCommand request, CancellationToken ct)
     {
         repository.Provision(request.UserId);
@@ -78,7 +89,18 @@ public sealed class CreditHandlers(ICreditRepository repository) :
         if (request.ActualTokenUnits < 0 || request.ActualTokenUnits > 10_000_000_000) throw new CreditDomainException(400, "VALIDATION_ERROR", "actualTokenUnits 超出允许范围。");
         return Task.FromResult(View(repository.Settle(request.OperationId, request.ActualTokenUnits)));
     }
-    public Task<ReservationView> Handle(ReleaseCreditsCommand request, CancellationToken ct) => Task.FromResult(View(repository.Release(request.OperationId)));
+    public Task<ReservationView> Handle(ReleaseCreditsCommand request, CancellationToken ct)
+    {
+        try
+        {
+            return Task.FromResult(View(repository.Release(request.OperationId)));
+        }
+        catch
+        {
+            CreditServiceMetrics.RecordReleaseFailure();
+            throw;
+        }
+    }
     private static string NormalizeCode(string value) => string.IsNullOrWhiteSpace(value) || value.Trim().Length > 48 ? throw new CreditDomainException(400, "VALIDATION_ERROR", "兑换码格式不正确。") : value.Trim().ToUpperInvariant();
     private static CreditDomainException NotFound() => new(404, "RESOURCE_NOT_FOUND", "资源不存在。");
     private static RedemptionCodeView View(RedemptionCode x) => new(x.CodeId, x.Code, CreditPolicy.ToCredits(x.CreditUnits), x.Status.ToString().ToUpperInvariant(), x.RedeemedBy, x.RedeemedAt, x.ExpiresAt, x.CreatedAt);

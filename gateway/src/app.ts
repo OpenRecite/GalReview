@@ -5,6 +5,12 @@ import { traceContextMiddleware } from './middleware/traceContext.js';
 import { createBodyDrain } from './middleware/bodyDrain.js';
 import { headerSanitizerMiddleware } from './middleware/headerSanitizer.js';
 import { createAuthenticationMiddleware } from './middleware/authentication.js';
+import { createIntrospectionCache } from './middleware/introspectionCache.js';
+import {
+  createMetricsMiddleware,
+  createMetricsRegistry,
+  instrumentIntrospectionCache,
+} from './middleware/metrics.js';
 import { createServiceIdentityMiddleware } from './middleware/serviceIdentity.js';
 import { createRateLimiters } from './middleware/rateLimiter.js';
 import { errorHandlerMiddleware, notFoundHandler } from './middleware/errorHandler.js';
@@ -28,6 +34,14 @@ export {
  */
 export function createApp(config: GatewayConfig): express.Express {
   const app = express();
+
+  const metrics = createMetricsRegistry();
+  const introspectionCache = createIntrospectionCache({
+    positiveTtlMs: config.introspectionCache.positiveTtlMs,
+    negativeTtlMs: config.introspectionCache.negativeTtlMs,
+    maxEntries: config.introspectionCache.maxEntries,
+  });
+  instrumentIntrospectionCache(introspectionCache, metrics);
 
   // 客户端 IP 还原策略。默认 false：X-Forwarded-For 一律不采信，req.ip 取
   // socket 对端地址——网关端口可直连时，无条件信任该头等于把匿名限流的桶
@@ -64,6 +78,13 @@ export function createApp(config: GatewayConfig): express.Express {
   // 3. 健康检查（无需鉴权和清洗）
   app.use(createHealthRouter(config));
 
+  // 3.1 指标端点（供 scrape；不含鉴权，绑定默认 127.0.0.1）
+  app.use(createMetricsMiddleware(metrics));
+  app.get('/metrics', (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+    res.send(metrics.render());
+  });
+
   // 4. 请求头清洗（剥离客户端伪造的内部身份头）
   app.use(headerSanitizerMiddleware);
 
@@ -85,7 +106,7 @@ export function createApp(config: GatewayConfig): express.Express {
   });
 
   // ===== 按路由表注册代理 =====
-  const authMiddleware = createAuthenticationMiddleware(config);
+  const authMiddleware = createAuthenticationMiddleware(config, introspectionCache);
   const serviceMiddleware = createServiceIdentityMiddleware(config);
   const rateLimiters = createRateLimiters(config);
 
@@ -104,8 +125,8 @@ export function createApp(config: GatewayConfig): express.Express {
       middlewares.push(rateLimiters[route.rateLimitCategory]);
     }
 
-    // 代理
-    const proxy = createProxyForRoute(route, config);
+    // 代理（上游失败计入 metrics，供告警）
+    const proxy = createProxyForRoute(route, config, (service, kind) => metrics.onUpstreamFailure(service, kind));
     middlewares.push(proxy as unknown as express.RequestHandler);
 
     if (route.methods && route.methods.length > 0) {

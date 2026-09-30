@@ -213,11 +213,38 @@ async function serveFrontend(request, response) {
 
   const extension = extname(filePath).toLowerCase()
   const isWikiRequest = pathname === '/wiki' || pathname.startsWith('/wiki/')
+  const isHtml = extension === '.html' || extension === ''
+  /**
+   * 同源静态站 CSP。
+   * wasm-unsafe-eval：RenderService 的 runtime.wasm 需要 WebAssembly.compile；
+   * 不用 unsafe-eval，仍禁止 eval()/new Function。
+   */
+  const csp = [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "img-src 'self' data: blob:",
+    "media-src 'self' blob:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "script-src 'self' 'wasm-unsafe-eval'",
+    "style-src 'self' 'unsafe-inline'",
+    "worker-src 'self' blob:",
+  ].join('; ')
   response.writeHead(200, {
     'Content-Type': contentTypes.get(extension) || 'application/octet-stream',
-    'Cache-Control': isWikiRequest || extension === '.html'
+    'Cache-Control': isWikiRequest || isHtml
       ? 'no-cache'
       : 'public, max-age=604800, immutable',
+    ...(isHtml
+      ? {
+          'Content-Security-Policy': csp,
+          'X-Content-Type-Options': 'nosniff',
+          'Referrer-Policy': 'strict-origin-when-cross-origin',
+          'X-Frame-Options': 'DENY',
+        }
+      : { 'X-Content-Type-Options': 'nosniff' }),
   })
   createReadStream(filePath).on('error', () => response.destroy()).pipe(response)
 }

@@ -40,10 +40,12 @@ public sealed class ContentHandlers(IPracticeRepository repository, IPracticeGat
         PracticePlanRules.Validate(project, request.OwnerUserId, plan);
         if (plan.Points.Count == 0)
             throw new PracticeDomainException(422, "PLAN_TARGETS_EMPTY", "复习计划没有可用于生成题目的目标知识点。");
-        var materials = new List<MaterialText>();
-        foreach (var materialId in project.MaterialIds)
+        // 资料最多 20 份，并行拉取以避免串行 N+1；顺序与 MaterialIds 一致
+        var fetchedMaterials = await Task.WhenAll(
+            project.MaterialIds.Select(id => gateway.GetMaterialTextAsync(id, ct)));
+        var materials = new List<MaterialText>(fetchedMaterials.Length);
+        foreach (var material in fetchedMaterials)
         {
-            var material = await gateway.GetMaterialTextAsync(materialId, ct);
             if (material.OwnerUserId != request.OwnerUserId) throw PracticeOwnership.NotFound();
             materials.Add(material);
         }
@@ -132,10 +134,15 @@ public sealed class ContentHandlers(IPracticeRepository repository, IPracticeGat
     public async Task<QuestionHelp> Handle(GetQuestionHelpQuery request, CancellationToken ct)
     {
         var question = repository.GetQuestion(request.QuestionId) ?? throw PracticeOwnership.NotFound();
-        _ = PracticeOwnership.Project(question.ProjectId, request.OwnerUserId, repository); var matches = new List<QuestionHelpMatch>();
-        foreach (var source in question.SourceReferences.Take(3))
+        _ = PracticeOwnership.Project(question.ProjectId, request.OwnerUserId, repository);
+        var sources = question.SourceReferences.Take(3).ToArray();
+        var fetched = await Task.WhenAll(sources.Select(s => gateway.GetMaterialTextAsync(s.MaterialId, ct)));
+        var matches = new List<QuestionHelpMatch>();
+        for (var i = 0; i < sources.Length; i++)
         {
-            var material = await gateway.GetMaterialTextAsync(source.MaterialId, ct); if (material.OwnerUserId != request.OwnerUserId) continue;
+            var source = sources[i];
+            var material = fetched[i];
+            if (material.OwnerUserId != request.OwnerUserId) continue;
             var start = (int)Math.Clamp(source.StartOffset, 0, material.Text.Length); var end = (int)Math.Clamp(source.EndOffset, start, material.Text.Length);
             var excerpt = material.Text[start..end]; matches.Add(new(question.KnowledgePointId, question.Prompt, excerpt, source, PracticeRules.LevenshteinSimilarity(question.Prompt, excerpt)));
         }
@@ -237,7 +244,12 @@ public sealed class ProjectHandlers(IPracticeRepository repository, IPracticeGat
     private static string ValidateName(string value) { var name = value.Trim(); if (name.Length is < 1 or > 120) throw new PracticeDomainException(400, "VALIDATION_ERROR", "name 必须包含 1-120 个字符。"); return name; }
     private static IReadOnlyList<Guid> ValidateMaterials(IEnumerable<Guid> value) { var ids = value.Distinct().ToArray(); if (ids.Length is < 1 or > 20 || ids.Any(x => x == Guid.Empty)) throw new PracticeDomainException(400, "PROJECT_MATERIALS_REQUIRED", "项目必须引用 1-20 份有效资料。"); return ids; }
     private async Task ValidateMaterialOwnership(IReadOnlyList<Guid> ids, Guid owner, CancellationToken ct)
-    { foreach (var id in ids) { var material = await gateway.GetMaterialTextAsync(id, ct); if (material.OwnerUserId != owner) throw PracticeOwnership.NotFound(); } }
+    {
+        // 最多 20 份资料：并行校验所有权，避免串行 N+1
+        var materials = await Task.WhenAll(ids.Select(id => gateway.GetMaterialTextAsync(id, ct)));
+        if (materials.Any(material => material.OwnerUserId != owner))
+            throw PracticeOwnership.NotFound();
+    }
     private static string? NormalizeSubject(string? value) { if (string.IsNullOrWhiteSpace(value)) return null; var result = value.Trim().ToUpperInvariant(); if (!System.Text.RegularExpressions.Regex.IsMatch(result, "^[A-Z][A-Z0-9_]{0,31}$")) throw new PracticeDomainException(400, "VALIDATION_ERROR", "subjectCode 格式无效。"); return result; }
 }
 

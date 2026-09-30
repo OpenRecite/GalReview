@@ -18,6 +18,7 @@ using KnowledgeService.Persistence.Repositories;
 using Neo4j.Driver;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Logging.AddJsonStructuredLogging();
 
 var neo4jOptions = builder.Configuration
     .GetSection(Neo4jOptions.SectionName)
@@ -31,6 +32,12 @@ var gatewayTrustOptions = builder.Configuration
 neo4jOptions.Validate();
 materialTextOptions.Validate();
 gatewayTrustOptions.Validate();
+if (builder.Environment.IsProduction() &&
+    string.Equals(gatewayTrustOptions.ServiceKey, "moonstone-local-gateway-key", StringComparison.Ordinal))
+{
+    throw new InvalidOperationException(
+        "Gateway:ServiceKey must be changed from the development default in production.");
+}
 
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
@@ -67,6 +74,7 @@ builder.Services.AddHostedService<GraphBuildRecoveryService>();
 
 var app = builder.Build();
 app.UseMiddleware<TraceContextMiddleware>();
+app.UseRequestLogging("KnowledgeService");
 app.UseMiddleware<ApiExceptionMiddleware>();
 app.UseMiddleware<GatewayTrustMiddleware>();
 

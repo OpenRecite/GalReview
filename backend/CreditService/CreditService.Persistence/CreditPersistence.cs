@@ -44,6 +44,94 @@ public sealed class MySqlCreditRepository(CreditDatabase database) : ICreditRepo
         if(inserted==1){q.Parameters.Clear();q.CommandText="INSERT INTO credit_ledger(entry_id,user_id,operation_id,entry_type,units,balance_after_units,created_at) VALUES(@id,@user,NULL,'INITIAL_GRANT',@units,@units,UTC_TIMESTAMP(6))";q.Parameters.AddWithValue("@id",Guid.NewGuid());q.Parameters.AddWithValue("@user",userId);q.Parameters.AddWithValue("@units",CreditPolicy.InitialUnits);q.ExecuteNonQuery();}
         tx.Commit(); return GetAccount(userId)!;
     }
+    public IReadOnlyList<CreditAccount> ProvisionMany(IReadOnlyList<Guid> userIds)
+    {
+        if (userIds.Count == 0) return [];
+        var ordered = userIds.Distinct().ToArray();
+        using var c = database.Open();
+        using var tx = c.BeginTransaction();
+        // 1) 已有账户
+        var existing = new Dictionary<Guid, CreditAccount>(ordered.Length);
+        foreach (var chunk in Chunk(ordered, 200))
+        {
+            using var select = c.CreateCommand();
+            select.Transaction = tx;
+            var names = new List<string>(chunk.Length);
+            for (var i = 0; i < chunk.Length; i++)
+            {
+                var p = $"@u{i}";
+                names.Add(p);
+                select.Parameters.AddWithValue(p, chunk[i]);
+            }
+            select.CommandText = $"SELECT user_id,balance_units,held_units,created_at,updated_at FROM credit_accounts WHERE user_id IN ({string.Join(',', names)})";
+            using var reader = select.ExecuteReader();
+            while (reader.Read())
+            {
+                var id = ReadGuid(reader, 0);
+                existing[id] = new(id, reader.GetInt64(1), reader.GetInt64(2), Utc(reader.GetDateTime(3)), Utc(reader.GetDateTime(4)));
+            }
+        }
+        // 2) 逐个开通缺失账户：仅在 INSERT 真正新建行时写 INITIAL_GRANT，
+        //    避免并发 ProvisionMany 对同一用户双写初始额度。
+        var missing = ordered.Where(id => !existing.ContainsKey(id)).ToArray();
+        foreach (var id in missing)
+        {
+            using var insert = c.CreateCommand();
+            insert.Transaction = tx;
+            insert.CommandText = "INSERT IGNORE INTO credit_accounts(user_id,balance_units,held_units,created_at,updated_at) VALUES(@user,@initial,0,UTC_TIMESTAMP(6),UTC_TIMESTAMP(6))";
+            insert.Parameters.AddWithValue("@user", id);
+            insert.Parameters.AddWithValue("@initial", CreditPolicy.InitialUnits);
+            var inserted = insert.ExecuteNonQuery();
+            if (inserted != 1) continue;
+            using var ledger = c.CreateCommand();
+            ledger.Transaction = tx;
+            ledger.CommandText = "INSERT INTO credit_ledger(entry_id,user_id,operation_id,entry_type,units,balance_after_units,created_at) VALUES(@id,@user,NULL,'INITIAL_GRANT',@units,@units,UTC_TIMESTAMP(6))";
+            ledger.Parameters.AddWithValue("@id", Guid.NewGuid());
+            ledger.Parameters.AddWithValue("@user", id);
+            ledger.Parameters.AddWithValue("@units", CreditPolicy.InitialUnits);
+            ledger.ExecuteNonQuery();
+        }
+        tx.Commit();
+        // 3) 回读并按入参顺序返回；缺失（极罕见：提交后被并发删除）则再走单户 Provision
+        var byId = new Dictionary<Guid, CreditAccount>(ordered.Length);
+        foreach (var chunk in Chunk(ordered, 200))
+        {
+            using var select = c.CreateCommand();
+            var names = new List<string>(chunk.Length);
+            for (var i = 0; i < chunk.Length; i++)
+            {
+                var p = $"@r{i}";
+                names.Add(p);
+                select.Parameters.AddWithValue(p, chunk[i]);
+            }
+            select.CommandText = $"SELECT user_id,balance_units,held_units,created_at,updated_at FROM credit_accounts WHERE user_id IN ({string.Join(',', names)})";
+            using var reader = select.ExecuteReader();
+            while (reader.Read())
+            {
+                var id = ReadGuid(reader, 0);
+                byId[id] = new(id, reader.GetInt64(1), reader.GetInt64(2), Utc(reader.GetDateTime(3)), Utc(reader.GetDateTime(4)));
+            }
+        }
+        var result = new List<CreditAccount>(ordered.Length);
+        foreach (var id in ordered)
+        {
+            if (byId.TryGetValue(id, out var account))
+                result.Add(account);
+            else
+                result.Add(Provision(id));
+        }
+        return result;
+    }
+    private static IEnumerable<T[]> Chunk<T>(T[] source, int size)
+    {
+        for (var i = 0; i < source.Length; i += size)
+        {
+            var take = Math.Min(size, source.Length - i);
+            var part = new T[take];
+            Array.Copy(source, i, part, 0, take);
+            yield return part;
+        }
+    }
     public CreditAccount? GetAccount(Guid userId){using var c=database.Open();using var q=c.CreateCommand();q.CommandText="SELECT balance_units,held_units,created_at,updated_at FROM credit_accounts WHERE user_id=@user";q.Parameters.AddWithValue("@user",userId);using var r=q.ExecuteReader();return r.Read()?new(userId,r.GetInt64(0),r.GetInt64(1),Utc(r.GetDateTime(2)),Utc(r.GetDateTime(3))):null;}
     public void DeleteAccount(Guid userId){using var c=database.Open();using var tx=c.BeginTransaction();using var q=c.CreateCommand();q.Transaction=tx;q.CommandText="DELETE FROM credit_ledger WHERE user_id=@user;DELETE FROM credit_reservations WHERE user_id=@user;DELETE FROM credit_accounts WHERE user_id=@user";q.Parameters.AddWithValue("@user",userId);q.ExecuteNonQuery();tx.Commit();}
     public (CreditAccount Account, RedemptionCode Code) Redeem(Guid userId,string code)
@@ -61,7 +149,7 @@ public sealed class MySqlCreditRepository(CreditDatabase database) : ICreditRepo
     public CreditReservation Reserve(Guid user,Guid operation,string type,long estimate)
     {
         using var c=database.Open();using var tx=c.BeginTransaction();using var q=c.CreateCommand();q.Transaction=tx;q.CommandText="SELECT user_id,operation_type,estimated_units,actual_units,status,created_at,updated_at FROM credit_reservations WHERE operation_id=@op FOR UPDATE";q.Parameters.AddWithValue("@op",operation);using(var r=q.ExecuteReader()){if(r.Read()){var existing=ReadReservation(operation,r);if(existing.UserId!=user||existing.OperationType!=type||existing.EstimatedUnits!=estimate)throw new CreditDomainException(409,"IDEMPOTENCY_KEY_REUSED","operationId 已用于不同的 credits 预授权。");tx.Commit();return existing;}}
-        q.Parameters.Clear();q.CommandText="SELECT balance_units,held_units FROM credit_accounts WHERE user_id=@user FOR UPDATE";q.Parameters.AddWithValue("@user",user);long balance,held;using(var r=q.ExecuteReader()){if(!r.Read())throw new CreditDomainException(404,"RESOURCE_NOT_FOUND","credits 账户不存在。");balance=r.GetInt64(0);held=r.GetInt64(1);}if(balance-held<estimate)throw new CreditDomainException(402,"CREDITS_INSUFFICIENT","credits 不足，需要先兑换 credits。",new{balance=CreditPolicy.ToCredits(balance-held),required=CreditPolicy.ToCredits(estimate),purchaseUrl="https://pay.ldxp.cn/shop/7CX09W5E"});
+        q.Parameters.Clear();q.CommandText="SELECT balance_units,held_units FROM credit_accounts WHERE user_id=@user FOR UPDATE";q.Parameters.AddWithValue("@user",user);long balance,held;using(var r=q.ExecuteReader()){if(!r.Read())throw new CreditDomainException(404,"RESOURCE_NOT_FOUND","credits 账户不存在。");balance=r.GetInt64(0);held=r.GetInt64(1);}if(balance-held<estimate)throw new CreditDomainException(402,"CREDITS_INSUFFICIENT","credits 不足，需要先兑换 credits。",new{balance=CreditPolicy.ToCredits(balance-held),required=CreditPolicy.ToCredits(estimate),purchaseUrl=CreditPolicy.PurchaseUrl});
         q.Parameters.Clear();q.CommandText="UPDATE credit_accounts SET held_units=held_units+@estimate,updated_at=UTC_TIMESTAMP(6) WHERE user_id=@user";q.Parameters.AddWithValue("@estimate",estimate);q.Parameters.AddWithValue("@user",user);q.ExecuteNonQuery();q.Parameters.Clear();q.CommandText="INSERT INTO credit_reservations(operation_id,user_id,operation_type,estimated_units,actual_units,status,created_at,updated_at) VALUES(@op,@user,@type,@estimate,0,'HELD',UTC_TIMESTAMP(6),UTC_TIMESTAMP(6))";q.Parameters.AddWithValue("@op",operation);q.Parameters.AddWithValue("@user",user);q.Parameters.AddWithValue("@type",type);q.Parameters.AddWithValue("@estimate",estimate);q.ExecuteNonQuery();tx.Commit();return new(operation,user,type,estimate,0,ReservationStatus.Held,DateTimeOffset.UtcNow,DateTimeOffset.UtcNow);
     }
     public CreditReservation Settle(Guid operation,long actual)
@@ -92,13 +180,31 @@ public sealed class MemoryCreditRepository : ICreditRepository
 {
     private readonly object sync=new();private readonly Dictionary<Guid,CreditAccount> accounts=[];private readonly Dictionary<string,RedemptionCode> codes=new(StringComparer.OrdinalIgnoreCase);private readonly Dictionary<Guid,CreditReservation> reservations=[];
     public CreditAccount Provision(Guid user){lock(sync){if(!accounts.TryGetValue(user,out var a)){var now=DateTimeOffset.UtcNow;a=new(user,CreditPolicy.InitialUnits,0,now,now);accounts[user]=a;}return a;}}
+    public IReadOnlyList<CreditAccount> ProvisionMany(IReadOnlyList<Guid> userIds)
+    {
+        lock(sync)
+        {
+            var result = new List<CreditAccount>(userIds.Count);
+            foreach (var user in userIds.Distinct())
+            {
+                if (!accounts.TryGetValue(user, out var a))
+                {
+                    var now = DateTimeOffset.UtcNow;
+                    a = new(user, CreditPolicy.InitialUnits, 0, now, now);
+                    accounts[user] = a;
+                }
+                result.Add(a);
+            }
+            return result;
+        }
+    }
     public CreditAccount? GetAccount(Guid user){lock(sync)return accounts.GetValueOrDefault(user);}
     public void DeleteAccount(Guid user){lock(sync){accounts.Remove(user);foreach(var id in reservations.Where(x=>x.Value.UserId==user).Select(x=>x.Key).ToArray())reservations.Remove(id);}}
     public (CreditAccount,RedemptionCode) Redeem(Guid user,string code){lock(sync){if(!codes.TryGetValue(code,out var value)||value.Status!=RedemptionCodeStatus.Active||(value.ExpiresAt is not null&&value.ExpiresAt<=DateTimeOffset.UtcNow))throw new CreditDomainException(422,"REDEMPTION_CODE_UNAVAILABLE","兑换码无效、已使用、已撤销或已过期。");var a=accounts.GetValueOrDefault(user)??throw new CreditDomainException(404,"RESOURCE_NOT_FOUND","credits 账户不存在。");var now=DateTimeOffset.UtcNow;value=value with{Status=RedemptionCodeStatus.Redeemed,RedeemedBy=user,RedeemedAt=now};codes[code]=value;a=a with{BalanceUnits=a.BalanceUnits+value.CreditUnits,UpdatedAt=now};accounts[user]=a;return(a,value);}}
     public IReadOnlyList<RedemptionCode> ListCodes(){lock(sync)return codes.Values.OrderByDescending(x=>x.CreatedAt).ToArray();}
     public IReadOnlyList<RedemptionCode> CreateCodes(Guid admin,int count,long units,DateTimeOffset? expires){lock(sync){var result=new List<RedemptionCode>();while(result.Count<count){var code="QZ-"+Convert.ToHexString(RandomNumberGenerator.GetBytes(10));if(codes.ContainsKey(code))continue;var value=new RedemptionCode(Guid.NewGuid(),code,units,RedemptionCodeStatus.Active,null,null,expires,DateTimeOffset.UtcNow,admin);codes[code]=value;result.Add(value);}return result;}}
     public bool RevokeCode(Guid codeId){lock(sync){var pair=codes.FirstOrDefault(x=>x.Value.CodeId==codeId);if(pair.Value is null||pair.Value.Status!=RedemptionCodeStatus.Active)return false;codes[pair.Key]=pair.Value with{Status=RedemptionCodeStatus.Revoked};return true;}}
-    public CreditReservation Reserve(Guid user,Guid op,string type,long estimate){lock(sync){if(reservations.TryGetValue(op,out var old)){if(old.UserId!=user||old.OperationType!=type||old.EstimatedUnits!=estimate)throw new CreditDomainException(409,"IDEMPOTENCY_KEY_REUSED","operationId 已用于不同预授权。");return old;}var a=accounts.GetValueOrDefault(user)??throw new CreditDomainException(404,"RESOURCE_NOT_FOUND","credits 账户不存在。");if(a.AvailableUnits<estimate)throw new CreditDomainException(402,"CREDITS_INSUFFICIENT","credits 不足，需要先兑换 credits。",new{balance=CreditPolicy.ToCredits(a.AvailableUnits),required=CreditPolicy.ToCredits(estimate),purchaseUrl="https://pay.ldxp.cn/shop/7CX09W5E"});var now=DateTimeOffset.UtcNow;a=a with{HeldUnits=a.HeldUnits+estimate,UpdatedAt=now};accounts[user]=a;var r=new CreditReservation(op,user,type,estimate,0,ReservationStatus.Held,now,now);reservations[op]=r;return r;}}
+    public CreditReservation Reserve(Guid user,Guid op,string type,long estimate){lock(sync){if(reservations.TryGetValue(op,out var old)){if(old.UserId!=user||old.OperationType!=type||old.EstimatedUnits!=estimate)throw new CreditDomainException(409,"IDEMPOTENCY_KEY_REUSED","operationId 已用于不同预授权。");return old;}var a=accounts.GetValueOrDefault(user)??throw new CreditDomainException(404,"RESOURCE_NOT_FOUND","credits 账户不存在。");if(a.AvailableUnits<estimate)throw new CreditDomainException(402,"CREDITS_INSUFFICIENT","credits 不足，需要先兑换 credits。",new{balance=CreditPolicy.ToCredits(a.AvailableUnits),required=CreditPolicy.ToCredits(estimate),purchaseUrl=CreditPolicy.PurchaseUrl});var now=DateTimeOffset.UtcNow;a=a with{HeldUnits=a.HeldUnits+estimate,UpdatedAt=now};accounts[user]=a;var r=new CreditReservation(op,user,type,estimate,0,ReservationStatus.Held,now,now);reservations[op]=r;return r;}}
     public CreditReservation Settle(Guid op,long actual){lock(sync){var r=reservations.GetValueOrDefault(op)??throw new CreditDomainException(404,"RESOURCE_NOT_FOUND","credits 预授权不存在。");if(r.Status==ReservationStatus.Settled)return r;if(r.Status!=ReservationStatus.Held)throw new CreditDomainException(409,"STATE_CONFLICT","credits 预授权已经释放。");var a=accounts[r.UserId];var other=a.HeldUnits-r.EstimatedUnits;if(a.BalanceUnits-other<actual)throw new CreditDomainException(409,"CREDIT_ESTIMATE_EXCEEDED","实际消耗超过预授权且余额不足。");var now=DateTimeOffset.UtcNow;accounts[r.UserId]=a with{BalanceUnits=a.BalanceUnits-actual,HeldUnits=other,UpdatedAt=now};r=r with{ActualUnits=actual,Status=ReservationStatus.Settled,UpdatedAt=now};reservations[op]=r;return r;}}
     public CreditReservation Release(Guid op){lock(sync){var r=reservations.GetValueOrDefault(op)??throw new CreditDomainException(404,"RESOURCE_NOT_FOUND","credits 预授权不存在。");if(r.Status!=ReservationStatus.Held)return r;var a=accounts[r.UserId];var now=DateTimeOffset.UtcNow;accounts[r.UserId]=a with{HeldUnits=Math.Max(0,a.HeldUnits-r.EstimatedUnits),UpdatedAt=now};r=r with{Status=ReservationStatus.Released,UpdatedAt=now};reservations[op]=r;return r;}}
 }

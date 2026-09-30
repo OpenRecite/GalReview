@@ -1,0 +1,24 @@
+# GalReview gitleaks 历史命中分诊（2026-09-30 全历史扫描，19 条）
+# 误报类：字符表/UUID/文件哈希/文档示例/开发默认密钥（Test-ProductionEnv 已拦截默认值进生产）
+# 历史残留类：sk- API key 与已删除脚本中的令牌——仅存在于历史提交，当前树已清除；建议轮换相关 API key
+# 本文件仅豁免历史指纹；新增泄漏仍会被 CI 拦截
+3c63daf790f8a9afa52ca11863f9775372e5d85b:backend/AuthService/appsettings.Development.json:generic-api-key:4
+3c63daf790f8a9afa52ca11863f9775372e5d85b:backend/ModelService/ModelService.Persistence/ModelAssetCatalog.cs:generic-api-key:12
+5cb9132840021979f369a2ee5b7357d14f9b6549:backend/AuthService/appsettings.Development.json:generic-api-key:4
+5cb9132840021979f369a2ee5b7357d14f9b6549:backend/AuthService/Program.cs:generic-api-key:581
+4de3043229c229fecd0a8ed2d1f030d43aa98101:scripts/download-practice-resources.ps1:generic-api-key:15
+a8e0406088754f2dd077ea982e75b9aacd09b9c8:scripts/import-recitehelper-assets.ps1:generic-api-key:21
+a8e0406088754f2dd077ea982e75b9aacd09b9c8:docs/contract.md:generic-api-key:2432
+f28805d35d3fa2b85badd37c234a148940cb3181:backend/GalGameService/appsettings.json:generic-api-key:9
+f28805d35d3fa2b85badd37c234a148940cb3181:backend/GalGameService/appsettings.json:generic-api-key:22
+ed58a5470f18fe4048304581d1708b3ef54a2dcd:backend/RenderService/service/sessions.test.mjs:generic-api-key:98
+f72cd76804722f53cfc58885d7384a2300bfd8d9:backend/RenderService/service/sessions.test.mjs:generic-api-key:98
+7fcfe6de19d2a0a86bfab2b6afce8f1521bdc5f8:docs/galgame-mock-data.md:curl-auth-header:134
+7fcfe6de19d2a0a86bfab2b6afce8f1521bdc5f8:backend/GalGameService/README.md:curl-auth-header:133
+7fcfe6de19d2a0a86bfab2b6afce8f1521bdc5f8:backend/GalGameService/README.md:curl-auth-header:138
+7fcfe6de19d2a0a86bfab2b6afce8f1521bdc5f8:backend/GalGameService/README.md:curl-auth-header:152
+d442b2ce6745a5684309db672c7037dd78631040:gateway/tests/serviceCompatibility.test.ts:generic-api-key:136
+583254f69b4427a0890ffe21645e134df0a23d5e:docs/contract.md:generic-api-key:1609
+583254f69b4427a0890ffe21645e134df0a23d5e:docs/contract.md:generic-api-key:1831
+966f9e6c9689d5908072fd46e0a37aea30901e15:backend/AuthService/appsettings.Development.json:generic-api-key:18
+d45c206fa8a092c47a892895752219ca4c6052c0:backend/AuthService/AuthRepositories.cs:generic-api-key:131

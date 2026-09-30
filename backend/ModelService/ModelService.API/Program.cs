@@ -7,8 +7,7 @@ using ModelService.Persistence;
 using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Logging.ClearProviders();
-builder.Logging.AddConsole();
+builder.Logging.AddJsonStructuredLogging();
 builder.Services.Configure<Microsoft.AspNetCore.Routing.RouteHandlerOptions>(options =>
     options.ThrowOnBadRequest = true);
 builder.Services.ConfigureHttpJsonOptions(options =>
@@ -22,8 +21,11 @@ builder.Services.AddMediatR(configuration =>
 builder.Services.AddModelPersistence(builder.Configuration, builder.Environment.ContentRootPath);
 var gatewayKey = builder.Configuration["Gateway:ServiceKey"] ??
     throw new InvalidOperationException("Gateway:ServiceKey must be configured.");
+if (builder.Environment.IsProduction() && string.Equals(gatewayKey, "moonstone-local-gateway-key", StringComparison.Ordinal))
+    throw new InvalidOperationException("Gateway:ServiceKey must be changed from the development default in production.");
 
 var app = builder.Build();
+app.UseRequestLogging("ModelService");
 app.UseExceptionHandler(handler => handler.Run(async context =>
 {
     var exception = context.Features.Get<IExceptionHandlerFeature>()?.Error;
@@ -33,6 +35,15 @@ app.UseExceptionHandler(handler => handler.Run(async context =>
         context.Response.StatusCode = domain.StatusCode;
         await context.Response.WriteAsJsonAsync(ApiFailure.Create(
             domain.Code, domain.Message, trace, domain.Details));
+        return;
+    }
+    if (exception is InferenceOverloadedException overloaded)
+    {
+        // 背压：队列满时明确拒绝并给出退避时间，Practice 侧已有超时/失败→ABSTAINED 降级路径
+        context.Response.StatusCode = 503;
+        context.Response.Headers.RetryAfter = overloaded.RetryAfterSeconds.ToString();
+        await context.Response.WriteAsJsonAsync(ApiFailure.Create(
+            "MODEL_SERVICE_BUSY", "模型推理队列已满，请稍后重试。", trace));
         return;
     }
     if (exception is BadHttpRequestException bad)

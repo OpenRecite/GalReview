@@ -107,6 +107,8 @@ const sessionService: SessionService | null = sessionsEnabled
         serviceKey: gatewayServiceKey,
         timeoutMs: internalTimeoutMs,
       }),
+      // 可选文件快照：设置后重启可恢复会话（单实例部署）
+      persistPath: process.env.RENDER_SESSION_STORE_PATH?.trim() || null,
     })
   : null
 

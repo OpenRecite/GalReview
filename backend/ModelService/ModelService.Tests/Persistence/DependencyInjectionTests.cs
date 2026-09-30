@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using ModelService.Application;
 using ModelService.Persistence;
 using Xunit;
 
@@ -27,5 +28,12 @@ public sealed class DependencyInjectionTests
         Assert.Equal(
             Path.Combine(sharedRoot, "Models", "multilingual-minilm-nli", "model.onnx"),
             catalog.NliModelPath);
+        // 引擎与负载指标必须是同一单例，但此处不实例化（构造需要 ILogger）
+        var descriptors = services.Where(d =>
+                d.ServiceType == typeof(IFacetInferenceEngine)
+                || d.ServiceType == typeof(IInferenceLoadStats)
+                || d.ServiceType == typeof(MultilingualNliInferenceEngine))
+            .ToArray();
+        Assert.Equal(3, descriptors.Length);
     }
 }

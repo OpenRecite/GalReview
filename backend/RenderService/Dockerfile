@@ -22,6 +22,8 @@ COPY --from=build /out/GalReview.RenderService ./bin/GalReview.RenderService
 COPY --from=build /src/service/dist ./service/dist
 COPY service/demo ./service/demo
 COPY service/runtime.wasm.base64 ./service/
+# Session file snapshot mount point (optional RENDER_SESSION_STORE_PATH)
+RUN mkdir -p /data && chown node:node /data
 ENV PORT=5106 \
     RENDER_HOST=0.0.0.0
 EXPOSE 5106

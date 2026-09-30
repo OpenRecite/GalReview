@@ -26,7 +26,11 @@ const mockConfig: GatewayConfig = {
     creditService: { name: 'CreditService', url: 'http://localhost:5258' },
     modelService: { name: 'ModelService', url: 'http://localhost:5259' },
   },
-  rateLimit: {
+  introspectionCache: {
+    positiveTtlMs: 30_000,
+    negativeTtlMs: 5_000,
+    maxEntries: 10_000,
+  },  rateLimit: {
     anonymous: { windowMs: 60000, max: 100 },
     upload: { windowMs: 60000, max: 100 },
     generation: { windowMs: 60000, max: 100 },

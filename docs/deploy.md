@@ -2,7 +2,20 @@
 
 本文说明如何使用仓库根目录的 `compose.integration.yaml` 在本机或 Linux 服务器启动 GalReview。接口、鉴权头和跨服务调用以 [`contract.md`](contract.md) 为准；本文只记录部署方式，不另行定义接口。
 
-当前 Compose 是联调与单机部署基线，不是高可用集群方案。AuthService、UserService 和 CreditService 分别接入独立 MySQL 容器；仓库本地 Auth/User 默认值仍是 `Mock`，服务器 `.env` 模板则使用 `MySql`，CreditService 始终使用 MySQL。File、GalGame 与 PracticeService 使用同一 MongoDB 实例中的独立数据库。宿主发布端口的调整不改变接口路径、鉴权头、请求/响应结构或容器内部协议。
+当前 Compose 是联调与单机部署基线，不是高可用集群方案。AuthService、UserService 和 CreditService 分别接入独立 MySQL 容器；仓库本地 Auth/User 默认值仍是 `Mock`，服务器 `.env` 模板则使用 `MySql`，CreditService 始终使用 MySQL。
+
+> **Gateway 限流为进程内存态**：当前只支持单实例部署。需要水平扩展前，请先阅读 `gateway/README.md`「水平扩展约束」，将限流外置（如 Redis）后再扩副本。
+
+### 生产叠加层（禁止 Mock / 强制密钥）
+
+单机生产请**不要**只使用 `compose.integration.yaml`。在准备好 `.env` 后叠加：
+
+```bash
+./scripts/Test-ProductionEnv.ps1
+docker compose -f compose.integration.yaml -f compose.production.yaml up -d
+```
+
+`compose.production.yaml` 会强制 `MOONSTONE_MODE=MySql`，并用 `${VAR:?}` 要求 Gateway/服务密钥、MySQL/Neo4j 密码、管理员账号与 `CORS_ORIGINS` 必须显式提供。缺项时 `docker compose config` 或 `up` 会在解析阶段失败。门禁脚本同时拒绝 `.env` 中残留 `CHANGE_ME` 或开发默认密钥 `moonstone-local-gateway-key`。File、GalGame 与 PracticeService 使用同一 MongoDB 实例中的独立数据库。宿主发布端口的调整不改变接口路径、鉴权头、请求/响应结构或容器内部协议。
 
 ## 1. 部署范围
 

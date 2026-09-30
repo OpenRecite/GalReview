@@ -28,7 +28,11 @@ const baseConfig: GatewayConfig = {
     creditService: { name: 'CreditService', url: 'http://127.0.0.1:5258' },
     modelService: { name: 'ModelService', url: 'http://127.0.0.1:5259' },
   },
-  rateLimit: {
+  introspectionCache: {
+    positiveTtlMs: 30_000,
+    negativeTtlMs: 5_000,
+    maxEntries: 10_000,
+  },  rateLimit: {
     anonymous: { windowMs: 60_000, max: 100 },
     upload: { windowMs: 60_000, max: 100 },
     generation: { windowMs: 60_000, max: 100 },

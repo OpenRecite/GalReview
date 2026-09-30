@@ -4,3 +4,7 @@ dist/
 .env.local
 *.log
 *.tsbuildinfo
+# Playwright（T11 E2E）
+test-results/
+playwright-report/
+playwright/.cache/

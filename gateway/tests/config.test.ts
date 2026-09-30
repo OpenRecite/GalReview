@@ -31,6 +31,9 @@ describe('loadConfig', () => {
     ]);
     expect(cfg.defaultTimeoutMs).toBe(30_000);
     expect(cfg.uploadTimeoutMs).toBe(120_000);
+    expect(cfg.introspectionCache.positiveTtlMs).toBe(30_000);
+    expect(cfg.introspectionCache.negativeTtlMs).toBe(5_000);
+    expect(cfg.introspectionCache.maxEntries).toBe(10_000);
     expect(cfg.services.userService.url).toBe('http://localhost:5101');
     expect(cfg.services.authService.url).toBe('http://localhost:5102');
     expect(cfg.services.fileService.url).toBe('http://localhost:5103');
@@ -58,6 +61,7 @@ describe('loadConfig', () => {
     process.env.CORS_ORIGINS = 'http://localhost:5298';
     process.env.DEFAULT_TIMEOUT_MS = '10000';
     process.env.USER_SERVICE_URL = 'http://custom:5261';
+    process.env.INTROSPECTION_CACHE_TTL_MS = '12000';
 
     const cfg = loadConfig();
     expect(cfg.port).toBe(5297);
@@ -65,6 +69,7 @@ describe('loadConfig', () => {
     expect(cfg.gatewayKey).toBe('custom-key');
     expect(cfg.corsOrigins).toEqual(['http://localhost:5298']);
     expect(cfg.defaultTimeoutMs).toBe(10_000);
+    expect(cfg.introspectionCache.positiveTtlMs).toBe(12_000);
     expect(cfg.services.userService.url).toBe('http://custom:5261');
   });
 
@@ -140,6 +145,18 @@ describe('loadConfig', () => {
     expect(() => loadConfig()).toThrow(
       'READINESS_SERVICES contains unknown service keys: unknownService',
     );
+  });
+
+  it('生产环境缺少 GATEWAY_KEY 时应启动失败', () => {
+    delete process.env.GATEWAY_KEY;
+    process.env.NODE_ENV = 'production';
+    expect(() => loadConfig()).toThrow(/GATEWAY_KEY must be configured/);
+  });
+
+  it('非生产环境缺少 GATEWAY_KEY 时回退到开发默认密钥', () => {
+    delete process.env.GATEWAY_KEY;
+    delete process.env.NODE_ENV;
+    expect(loadConfig().gatewayKey).toBe('moonstone-local-gateway-key');
   });
 
   it('服务名应正确映射', () => {

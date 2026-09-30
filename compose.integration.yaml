@@ -1,3 +1,8 @@
+# 联调与单机部署基线。生产环境请叠加 compose.production.yaml：
+#   docker compose -f compose.integration.yaml -f compose.production.yaml up -d
+# 详见 docs/deploy.md「生产叠加层」与 scripts/Test-ProductionEnv.ps1
+# ⚠️ 本文件是联调/CI 栈：默认 Mock 模式 + 开发密钥 + Development 环境，
+#    禁止直接用于生产；生产叠加层强制注入全部密钥并要求非默认值。
 name: ${COMPOSE_PROJECT_NAME:-galreview-integration}
 
 services:
@@ -99,7 +104,7 @@ services:
     build:
       context: ./backend/UserService
     environment:
-      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: http://+:5101
       MOONSTONE_MODE: ${USER_SERVICE_MODE:-Mock}
       Gateway__ServiceKey: ${USER_SERVICE_KEY:-moonstone-local-gateway-key}
@@ -113,13 +118,14 @@ services:
     build:
       context: ./backend/AuthService
     environment:
-      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: http://+:5102
       MOONSTONE_MODE: ${AUTH_SERVICE_MODE:-Mock}
       Gateway__BaseUrl: http://gateway:5000
       Gateway__ServiceKey: ${AUTH_SERVICE_KEY:-moonstone-local-gateway-key}
       Admin__Username: ${GALREVIEW_ADMIN_USERNAME:-integration-admin}
       Admin__PasswordHash: ${GALREVIEW_ADMIN_PASSWORD_HASH:-AQAAAAIAAYagAAAAEOIs88DOZMchn4fIBwH9hLGMtw0+x+Y9rfbC1PiqJV76ncVm45+6INHh0elONRn5cg==}
+      Admin__PrincipalId: ${GALREVIEW_ADMIN_PRINCIPAL_ID:-00000000-0000-4000-8000-000000000001}
       Email__SmtpHost: ${SMTP_HOST:-}
       Email__SmtpPort: ${SMTP_PORT:-465}
       Email__UseSsl: ${SMTP_USE_SSL:-true}
@@ -142,11 +148,13 @@ services:
     build:
       context: ./backend/CreditService
     environment:
-      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: http://+:5108
       Gateway__ServiceKey: ${CREDIT_SERVICE_KEY:-moonstone-local-gateway-key}
       ConnectionStrings__CreditDatabase: "Server=credit-mysql;Port=3306;Database=qzwl_credit;User ID=qzwl_credit;Password=${CREDIT_MYSQL_PASSWORD:-credit-dev-password};SslMode=Disabled;AllowPublicKeyRetrieval=True"
       CreditStore__Provider: MySQL
+      Admin__PrincipalId: ${GALREVIEW_ADMIN_PRINCIPAL_ID:-00000000-0000-4000-8000-000000000001}
+      Credits__PurchaseUrl: ${CREDITS_PURCHASE_URL:-https://pay.ldxp.cn/shop/7CX09W5E}
     depends_on:
       credit-mysql:
         condition: service_healthy
@@ -156,7 +164,7 @@ services:
     build:
       context: ./backend/FileService
     environment:
-      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: http://+:5103
       Gateway__ServiceKey: ${FILE_SERVICE_KEY:-moonstone-local-gateway-key}
       ConnectionStrings__FileDatabase: mongodb://mongo:27017/qzwl_file
@@ -175,7 +183,7 @@ services:
       context: ./backend/KnowledgeService
       dockerfile: KnowledgeService.API/Dockerfile
     environment:
-      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: http://+:8080
       Neo4j__Uri: bolt://neo4j:7687
       Neo4j__Username: neo4j
@@ -196,7 +204,7 @@ services:
     build:
       context: ./backend/GalGameService
     environment:
-      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: http://+:5105
       Gateway__BaseUrl: http://gateway:5000
       Gateway__ServiceKey: ${GALGAME_SERVICE_KEY:-moonstone-local-gateway-key}
@@ -233,6 +241,10 @@ services:
       Gateway__BaseUrl: http://gateway:5000
       Gateway__ServiceName: RenderService
       Gateway__ServiceKey: ${RENDER_SERVICE_KEY:-moonstone-local-gateway-key}
+      # 文件快照：容器重启后可恢复进行中的故事会话（单实例）
+      RENDER_SESSION_STORE_PATH: ${RENDER_SESSION_STORE_PATH:-/data/render-sessions.json}
+    volumes:
+      - render-session-data:/data
     restart: unless-stopped
 
   model-service:
@@ -240,11 +252,13 @@ services:
       context: ./backend/ModelService
       dockerfile: ModelService.API/Dockerfile
     environment:
-      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: http://+:5109
       Gateway__ServiceKey: ${MODEL_SERVICE_KEY:-moonstone-local-gateway-key}
       Nli__MinimumTopProbability: ${MODEL_NLI_MIN_TOP_PROBABILITY:-0.75}
       Nli__MinimumMargin: ${MODEL_NLI_MIN_MARGIN:-0.20}
+      Nli__MaxConcurrentBatches: ${MODEL_NLI_MAX_BATCHES:-2}
+      Nli__FacetParallelism: ${MODEL_NLI_FACET_PARALLELISM:-4}
     restart: unless-stopped
 
   practice-service:
@@ -252,7 +266,7 @@ services:
       context: ./backend/PracticeService
       dockerfile: Dockerfile
     environment:
-      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: http://+:5107
       Gateway__BaseUrl: http://gateway:5000
       Gateway__ServiceName: PracticeService
@@ -277,7 +291,7 @@ services:
     build:
       context: ./gateway
     environment:
-      NODE_ENV: production
+      NODE_ENV: development
       GATEWAY_HOST: 0.0.0.0
       GATEWAY_PORT: 5000
       GATEWAY_KEY: ${GATEWAY_KEY:-moonstone-local-gateway-key}
@@ -358,3 +372,4 @@ volumes:
   credit-mysql-data:
   file-mongo-data:
   knowledge-neo4j-data:
+  render-session-data:

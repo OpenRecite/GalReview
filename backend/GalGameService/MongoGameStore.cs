@@ -172,7 +172,7 @@ public sealed class MongoGameStore : IGameStore
     /// 因为当前实例无法继续执行前一个实例的生成流程。
     /// 应在应用启动阶段调用。
     /// </summary>
-    public int RecoverStaleJobs()
+    public GameStaleJobRecovery RecoverStaleJobs()
     {
         try
         {
@@ -180,9 +180,13 @@ public sealed class MongoGameStore : IGameStore
                 Builders<GameGenerationJob>.Filter.Eq(j => j.Status, JobStatus.RUNNING),
                 Builders<GameGenerationJob>.Filter.Eq(j => j.Status, JobStatus.QUEUED));
 
+            // 先读后写：启动恢复发生在对外服务之前，读写间隙没有并发转换
+            var staleJobs = _jobs.Find(staleFilter).ToList();
+            if (staleJobs.Count == 0) return new GameStaleJobRecovery(0, []);
+
             var recoveryError = new ApiError(
                 Code: "JOB_RECOVERED_AFTER_RESTART",
-                Message: "Service restarted while job was running; job has been marked as failed",
+                Message: "Service restarted while job was pending or running; job has been marked as failed",
                 Details: new Dictionary<string, string>());
 
             var update = Builders<GameGenerationJob>.Update
@@ -192,23 +196,20 @@ public sealed class MongoGameStore : IGameStore
                 .Set(j => j.UpdatedAt, DateTimeOffset.UtcNow);
 
             var result = _jobs.UpdateMany(staleFilter, update);
-            var recovered = (int)result.ModifiedCount;
+            var failedIds = staleJobs.Select(j => j.GenerationId).ToList();
 
-            if (recovered > 0)
-            {
-                _logger?.LogWarning(
-                    "Recovered {Count} stale job(s) (RUNNING/QUEUED -> FAILED) after service restart",
-                    recovered);
-            }
+            _logger?.LogWarning(
+                "Recovered {Count} stale job(s) (RUNNING/QUEUED -> FAILED) after service restart",
+                result.ModifiedCount);
 
-            return recovered;
+            return new GameStaleJobRecovery((int)result.ModifiedCount, failedIds);
         }
         // 同上：不可达时是 TimeoutException，只捕 MongoException 会让"失败即维持原状"
         // 的自述路径实际走不到，异常会一路冒到启动逻辑
         catch (Exception ex) when (ex is MongoException or TimeoutException)
         {
             _logger?.LogWarning(ex, "Failed to recover stale jobs; they will remain in RUNNING/QUEUED state");
-            return 0;
+            return new GameStaleJobRecovery(0, []);
         }
     }
 

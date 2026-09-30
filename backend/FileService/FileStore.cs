@@ -12,6 +12,12 @@ public interface IFileStore
     IngestionJob? GetLatestJob(string materialId);
     IngestionJob? CreateJob(string materialId, string parserVersion, bool enableOcr, string ocrMode);
     Task ProcessJobAsync(string jobId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// 将 FAILED 任务重置为 QUEUED 并递增 AttemptCount；AttemptCount 已达 maxAttempts 时
+    /// 不再重排（死信：任务保持 FAILED 且带最后一次 Error，可经任务查询接口检索）。
+    /// </summary>
+    bool TryRequeueForRetry(string jobId, int maxAttempts);
     Stream? OpenContent(string materialId);
     ExtractedTextDocument? GetExtractedText(string materialId);
 }
@@ -95,6 +101,12 @@ public sealed class LocalFileStore : IFileStore
                 _materials[job.MaterialId] = current with { Material = current.Material with { Status = "FAILED", UpdatedAt = now } };
             _logger.LogWarning(exception, "Extraction failed for material {MaterialId}", job.MaterialId);
         }
+    }
+    public bool TryRequeueForRetry(string jobId, int maxAttempts)
+    {
+        if (!_jobs.TryGetValue(jobId, out var job) || job.Status != "FAILED" || job.AttemptCount >= maxAttempts) return false;
+        _jobs[jobId] = job with { Status = "QUEUED", Progress = 0, Error = null, AttemptCount = job.AttemptCount + 1, UpdatedAt = DateTimeOffset.UtcNow };
+        return true;
     }
     public Stream? OpenContent(string materialId) => _materials.TryGetValue(materialId, out var stored) && stored.Material.Status != "DELETED" && File.Exists(stored.ContentPath) ? File.OpenRead(stored.ContentPath) : null;
     public ExtractedTextDocument? GetExtractedText(string materialId) => _materials.TryGetValue(materialId, out var stored) ? stored.ExtractedText : null;

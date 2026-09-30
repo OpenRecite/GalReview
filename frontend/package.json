@@ -9,6 +9,8 @@
     "build:wiki": "node scripts/build-wiki.mjs",
     "build:wiki:dev": "node scripts/build-wiki.mjs --output public/wiki",
     "typecheck": "tsc -b --pretty false",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
     "preview": "vite preview"
   },
   "allowScripts": {
@@ -21,12 +23,14 @@
     "react-router": "^8.3.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.57.0",
     "@types/node": "^24.10.0",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",
     "marked": "17.0.5",
     "typescript": "~5.8.3",
-    "vite": "^7.2.4"
+    "vite": "^7.2.4",
+    "vitest": "^5.0.0"
   }
 }

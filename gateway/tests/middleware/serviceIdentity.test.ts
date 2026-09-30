@@ -19,7 +19,11 @@ const mockConfig: GatewayConfig = {
     renderService: { name: 'RenderService', url: 'http://localhost:5106' },
     practiceService: { name: 'PracticeService', url: 'http://localhost:5107' },
   },
-  rateLimit: {
+  introspectionCache: {
+    positiveTtlMs: 30_000,
+    negativeTtlMs: 5_000,
+    maxEntries: 10_000,
+  },  rateLimit: {
     anonymous: { windowMs: 60000, max: 20 },
     upload: { windowMs: 60000, max: 10 },
     generation: { windowMs: 60000, max: 5 },

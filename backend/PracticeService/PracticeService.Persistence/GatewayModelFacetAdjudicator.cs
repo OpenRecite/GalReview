@@ -28,6 +28,7 @@ public sealed class GatewayModelFacetAdjudicator(
                 "/internal/v1/model-inference/facet-adjudications");
             request.Headers.TryAddWithoutValidation("X-Service-Name", ServiceName);
             request.Headers.TryAddWithoutValidation("X-Service-Key", ServiceKey);
+            request.Headers.TryAddWithoutValidation("X-Correlation-Id", TraceFlow.Current ?? Guid.NewGuid().ToString("N"));
             request.Content = JsonContent.Create(new
             {
                 answer,

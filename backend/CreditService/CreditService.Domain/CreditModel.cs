@@ -4,6 +4,8 @@ public static class CreditPolicy
 {
     public const long UnitsPerCredit = 100_000;
     public const long InitialUnits = UnitsPerCredit;
+    /// <summary>不足时返回的购买入口；生产可通过 Credits:PurchaseUrl 覆盖。</summary>
+    public static string PurchaseUrl { get; set; } = "https://pay.ldxp.cn/shop/7CX09W5E";
     public static decimal ToCredits(long units) => decimal.Round(units / (decimal)UnitsPerCredit, 5, MidpointRounding.AwayFromZero);
     public static long ToUnits(decimal credits)
     {

@@ -20,7 +20,11 @@ const mockConfig: GatewayConfig = {
   services: {
     authService: { name: 'AuthService', url: 'http://localhost:5259' },
   },
-  rateLimit: {
+  introspectionCache: {
+    positiveTtlMs: 30_000,
+    negativeTtlMs: 5_000,
+    maxEntries: 10_000,
+  },  rateLimit: {
     anonymous: { windowMs: 60000, max: 20 },
     upload: { windowMs: 60000, max: 10 },
     generation: { windowMs: 60000, max: 5 },
@@ -81,6 +85,53 @@ describe('authenticationMiddleware', () => {
       .set('Authorization', 'Basic abc123');
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe('AUTH_REQUIRED');
+  });
+
+  it('相同令牌在缓存 TTL 内应只内省一次', async () => {
+    const future = new Date(Date.now() + 3_600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        successEnvelope({
+          ...VALID_ACTIVE_INTROSPECTION,
+          expiresAt: future,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const first = await request(app)
+      .get('/protected/data')
+      .set('Authorization', 'Bearer cached-token');
+    const second = await request(app)
+      .get('/protected/data')
+      .set('Authorization', 'Bearer cached-token');
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(second.body.userId).toBe(VALID_ACTIVE_INTROSPECTION.userId);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('不同令牌应各自内省', async () => {
+    const future = new Date(Date.now() + 3_600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        successEnvelope({
+          ...VALID_ACTIVE_INTROSPECTION,
+          expiresAt: future,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    await request(app)
+      .get('/protected/data')
+      .set('Authorization', 'Bearer token-one');
+    await request(app)
+      .get('/protected/data')
+      .set('Authorization', 'Bearer token-two');
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
   it('应拒绝 Bearer 后无 token 的请求', async () => {

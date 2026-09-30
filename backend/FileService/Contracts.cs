@@ -5,7 +5,7 @@ public sealed record Material(string MaterialId, string OwnerUserId, string Disp
 public sealed record MaterialPage(IReadOnlyList<Material> Items, string? NextCursor);
 public sealed record CreateIngestionJobRequest(string? ParserVersion, bool Force = false, bool EnableOcr = false, string? OcrMode = null);
 [BsonIgnoreExtraElements]
-public sealed record IngestionJob(string JobId, string MaterialId, string Status, int Progress, string ParserVersion, ApiError? Error, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, bool EnableOcr = false, string OcrMode = "standard", bool OcrUsed = false);
+public sealed record IngestionJob(string JobId, string MaterialId, string Status, int Progress, string ParserVersion, ApiError? Error, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, bool EnableOcr = false, string OcrMode = "standard", bool OcrUsed = false, int AttemptCount = 0);
 public sealed record CreateAccessGrantRequest(string Purpose);
 public sealed record AccessGrant(string Url, DateTimeOffset ExpiresAt);
 public sealed record TextSourceSpan(long StartOffset, long EndOffset, int? PageNumber, int? ParagraphIndex, string? SourceLabel);

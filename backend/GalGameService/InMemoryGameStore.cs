@@ -34,10 +34,10 @@ public interface IGameStore
     GameAudioAsset? GetAudio(Guid packageId, string assetId);
 
     /// <summary>
-    /// 启动恢复：将卡在 RUNNING/QUEUED 的任务标记为 FAILED。
-    /// InMemoryGameStore 无持久化，直接返回 0。
+    /// 启动恢复：将卡在 RUNNING/QUEUED 的任务标记为 FAILED，并返回失败作业 ID
+    /// （调用方负责释放其 HELD 预授权）。InMemoryGameStore 无持久化，无事可恢复。
     /// </summary>
-    int RecoverStaleJobs() => 0;
+    GameStaleJobRecovery RecoverStaleJobs() => new(0, []);
 }
 
 public sealed class InMemoryGameStore : IGameStore

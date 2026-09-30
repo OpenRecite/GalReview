@@ -1,24 +1,134 @@
 name: CI
 
-# 千知万理 GalReview — 最小可用 CI
-# 覆盖：.NET 服务（Auth/User/File/GalGame/Knowledge）构建与测试、gateway 构建与测试
+# 千知万理 GalReview — 核心闭环 CI
+# 覆盖：
+#   - secret 扫描（gitleaks，全历史）
+#   - 路径过滤（changes job）：仅相关目录变更时触发对应服务 job
+#   - 端口策略门禁
+#   - .NET：Auth/User/File/GalGame/Knowledge 构建或测试 + Practice/Credit 测试 + Model 单元测试
+#   - Gateway：build + test
+#   - RenderService：build + test
+#   - Frontend：typecheck + build
+#   - Frontend E2E（可选，Playwright 冒烟；稳定绿一周后转必需）
 # 触发：main 分支推送 + 指向 main 的 PR
+# 说明：ModelService Integration 测试依赖真实 ONNX 资产（~500MB，OSCA/下载器），
+#       CI 只跑不依赖资产的 Domain/Persistence 单元测试；资产门禁由部署脚本负责。
+#       该排除为已评审决策：待 ONNX 资产 hash 门禁就绪后再评估启用。
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      integration_smoke:
+        description: 'Run compose integration smoke (config + required env gate)'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
-# 同一分支新运行自动取消旧运行，省额度
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for secrets
+        # 直接跑 gitleaks CLI：gitleaks-action@v2 对组织仓库强制要求 GITLEAKS_LICENSE，
+        # 而官方二进制无此限制。版本与 .gitleaksignore 指纹分诊保持一致。
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz -C /tmp
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks detect --source . --redact --no-banner -v
+        env:
+          GITLEAKS_VERSION: 8.30.1
+
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+      platform: ${{ steps.filter.outputs.platform }}
+      gateway: ${{ steps.filter.outputs.gateway }}
+      render: ${{ steps.filter.outputs.render }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      desktop: ${{ steps.filter.outputs.desktop }}
+      mobile: ${{ steps.filter.outputs.mobile }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check path filters
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            core:
+              - 'backend/PracticeService/**'
+              - 'backend/CreditService/**'
+              - 'backend/ModelService/**'
+              - 'docs/contract.md'
+              - '.github/workflows/ci.yml'
+            platform:
+              - 'backend/AuthService/**'
+              - 'backend/UserService/**'
+              - 'backend/FileService/**'
+              - 'backend/GalGameService/**'
+              - 'backend/KnowledgeService/**'
+              - '.github/workflows/ci.yml'
+            gateway:
+              - 'gateway/**'
+              - '.github/workflows/ci.yml'
+            render:
+              - 'backend/RenderService/**'
+              - '.github/workflows/ci.yml'
+            frontend:
+              - 'frontend/**'
+              - '.github/workflows/ci.yml'
+            desktop:
+              - 'desktop/**'
+              - '.github/workflows/ci.yml'
+            mobile:
+              - 'mobile/**'
+              - '.github/workflows/ci.yml'
+
+  integration-smoke:
+    name: Compose integration smoke
+    if: github.event_name == 'workflow_dispatch' && inputs.integration_smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate compose config
+        run: docker compose -f compose.integration.yaml config --quiet
+
+      - name: Validate production overlay requires secrets
+        shell: pwsh
+        run: |
+          # 故意不提供 .env：production overlay 必须在解析期失败
+          docker compose -f compose.integration.yaml -f compose.production.yaml config --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error 'compose.production.yaml parsed without required secrets; gate is broken'
+            exit 1
+          }
+          Write-Host 'production overlay correctly rejected missing secrets'
+
+      - name: Port policy
+        shell: pwsh
+        run: ./scripts/Test-PortPolicy.ps1
+
   published-port-policy:
     name: Published host port policy
     runs-on: ubuntu-latest
@@ -30,26 +140,53 @@ jobs:
         shell: pwsh
         run: ./scripts/Test-PortPolicy.ps1
 
-  dotnet:
-    name: .NET services
+  dotnet-core:
+    name: .NET core loop (Practice/Credit/Model)
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 项目混合 net8.0（Auth/User/File）与 net10.0（GalGame/Knowledge）
-      - name: Setup .NET SDKs
+      - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: |
-            8.0.x
-            10.0.x
+          dotnet-version: 10.0.x
 
-      # FileService 无测试项目，单独构建以验证可编译
-      - name: Build FileService (no tests)
+      - name: Test PracticeService
+        run: dotnet test backend/PracticeService/PracticeService.Tests/PracticeService.Tests.csproj --nologo
+
+      - name: Test CreditService
+        run: dotnet test backend/CreditService/CreditService.Tests/CreditService.Tests.csproj --nologo
+
+      # Integration 需要 backend/ModelService/Resources 真实 NLI 资产，CI 不下载
+      - name: Test ModelService (unit only)
+        run: >
+          dotnet test backend/ModelService/ModelService.Tests/ModelService.Tests.csproj
+          --nologo
+          --filter "FullyQualifiedName!~Integration"
+
+  dotnet-platform:
+    name: .NET platform services
+    needs: changes
+    if: needs.changes.outputs.platform == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build FileService
         run: dotnet build backend/FileService/GalGame.FileService.csproj --nologo
 
-      # 四个测试项目各自 restore+build+test
+      - name: Test FileService
+        run: dotnet test backend/FileService/Tests/GalGame.FileService.Tests.csproj --nologo
+
       - name: Test AuthService
         run: dotnet test backend/AuthService/Tests/GalGame.AuthService.Tests.csproj --nologo
 
@@ -64,6 +201,8 @@ jobs:
 
   gateway:
     name: Gateway (Node)
+    needs: changes
+    if: needs.changes.outputs.gateway == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -82,9 +221,182 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # tsc 类型检查 + 产物构建
       - name: Build
         run: npm run build
 
       - name: Test
         run: npm test
+
+  render-service:
+    name: RenderService (Node)
+    needs: changes
+    if: needs.changes.outputs.render == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend/RenderService/service
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/RenderService/service/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+  frontend:
+    name: Frontend (Vite)
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+  # T11 前端 E2E 冒烟（Playwright）。
+  # 稳定性策略：API 一律 page.route mock，不依赖真实后端，因此与 dotnet/gateway
+  # job 解耦、可并行。当前为可选 job（continue-on-error），不阻塞主链路；
+  # **CI 里 E2E job 稳定绿一周后转必需**（去掉 continue-on-error 并纳入必需检查）。
+  frontend-e2e:
+    name: Frontend E2E smoke (optional)
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E smoke (desktop + mobile viewports)
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-e2e-report
+          path: |
+            frontend/playwright-report/
+            frontend/test-results/
+          retention-days: 7
+
+  desktop:
+    name: Desktop (Electron)
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Build frontend assets (extraResources dependency)
+        run: npm ci && npm run build
+        working-directory: frontend
+
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: desktop
+
+      - name: Build unpacked app (smoke, unsigned)
+        working-directory: desktop
+        env:
+          # 未配置签名材料时 sign.js 自行跳过
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder --win --dir
+
+  mobile:
+    name: Mobile (Capacitor Android)
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            mobile/package-lock.json
+
+      # capacitor.config.json 的 webDir 指向 ../frontend/dist，必须先构建前端
+      - name: Build frontend assets (Capacitor webDir)
+        run: npm ci && npm run build
+        working-directory: frontend
+
+      - name: Install mobile dependencies
+        run: npm ci
+        working-directory: mobile
+
+      - name: Sync Capacitor Android project
+        run: npx cap sync android
+        working-directory: mobile
+
+      - name: Build debug APK
+        run: chmod +x gradlew && ./gradlew assembleDebug --no-daemon
+        working-directory: mobile/android

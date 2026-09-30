@@ -1828,3 +1828,328 @@ Wiki 样式使用灰白纸面、固定目录、直角搜索框、表格和正文
 15 个同名 HTML、`/wiki/` 索引及 `wiki/res` 的 16 个资源逐一请求均为 HTTP 200；主页 bundle 中确认
 存在 3 个 `/wiki/` 入口。Frontend 容器使用新镜像重建，当前 16 个默认容器均为 healthy 并保持运行。
 Wiki 是 Frontend 的公开静态内容，不依赖用户会话；本轮没有调用 OCR，也没有关闭 Docker。
+
+## 43. 2026-09-30 P0 安全收尾验证（T2/T3）
+
+本节记录深度优化路线图 P0 项（T2 默认兜底清除 / T3 CI 补强）的实施证据。
+
+### 变更范围
+
+- Gateway：`GATEWAY_KEY` 在 `NODE_ENV=production` 下缺失即启动失败；非生产环境保留联调兜底。
+- 全部 8 个 .NET 服务：`Gateway:ServiceKey` 在生产环境禁止使用开发默认值 `moonstone-local-gateway-key`（启动即抛）。
+- Auth/Credit：管理员身份 `Admin:PrincipalId` 生产缺失即 fail-fast；`/readyz` 新增 `adminConfigured` 上报。
+- compose.production.yaml：auth/credit 强制注入 `Admin__PrincipalId`（`${VAR:?}`）；Test-ProductionEnv.ps1 必填清单同步。
+- compose.integration.yaml：显式定位为联调栈（ASPNETCORE_ENVIRONMENT=Development + Mock 默认），文件头声明禁止直接用于生产。
+- start_dev.ps1：本地栈固定 Development / development 环境。
+- CI：新增 gitleaks secret 扫描（全历史、版本钉 8.30.1、配 `.gitleaksignore` 分诊）与 dorny/paths-filter 路径过滤。
+
+### 测试证据（本机）
+
+| 套件 | 结果 |
+|---|---|
+| Gateway (vitest) | 218/218 通过（含 2 条新增生产守卫用例） |
+| CreditService | 7/7 |
+| PracticeService | 68/68 |
+| ModelService（单元，排除 Integration） | 4/4 |
+| AuthService | 18/18 |
+| UserService | 32/32 |
+| FileService | 18/18 |
+| GalGameService | 362/362 |
+| KnowledgeService | 115/115 |
+
+compose 反向门禁复验：integration 单独解析通过；叠加 production overlay 且缺密钥时解析失败（预期，exit 1）。
+
+注：本机 `dotnet test` 在 Git Bash 直调时静默无输出（.NET 10 SDK + bash 管道），经 `cmd //c`
+包装后输出正常；本表全部结果来自 cmd 包装运行。CI（ubuntu）不受影响。
+
+### gitleaks 分诊
+
+全历史 132 commits 扫描命中 19 条，逐条分诊后指纹写入 `.gitleaksignore`：
+
+- 误报：验证码字符表、UUID 测试夹具、资产 SHA256 校验哈希、文档 curl 示例、
+  ASP.NET Identity 开发哈希（仅 Development 配置）。
+- 历史残留：GalGameService/appsettings.json 曾提交的 2 个 `sk-` API key 与已删除脚本中的令牌——
+  **当前工作树已清除，但仍存在于两个远端的 git 历史中，建议轮换对应 API key**。
+
+CI 后续仅拦截新增指纹。
+
+### 遗留
+
+- OCRService 仍 0 测试（P2/T12）。
+- ModelService Integration 测试维持排除（评审决策，见 ci.yml 头注）。
+
+## 44. 2026-09-30 P1 可靠性与瘦身验证（T4–T8）
+
+### T4 后台任务重试/死信
+- FileService：`IngestionWorker` 失败按指数退避重试（`Ingestion:MaxAttempts` 默认 3、
+  `Ingestion:RetryBaseDelaySeconds` 默认 5s×2^n），`IngestionJob.AttemptCount` 落库；
+  超限保持 FAILED（死信，可经任务查询检索）；启动恢复从 ApplicationStarted 上的
+  fire-and-forget 收编进 Worker；删除路径 OCR 取消改 3s 限时 await（消灭 2 处 Task.Run）。
+- GalGameService：QUEUED→RUNNING 记录 `AttemptCount`；入队失败内联退避重试 3 次；
+  **启动恢复修复 credits 泄漏**——恢复置 FAILED 的作业现在逐一 `ReleaseAsync` 释放 HELD
+  预授权（`RecoverStaleJobs` 返回 `GameStaleJobRecovery(FailedCount, FailedJobIds)`）。
+- 生成类任务不加速率级自动重试（内部已有 provider/draft 重试；队列级重试会二次扣费）。
+
+### T5 推理背压
+- `Nli:MaxPendingBatches`（默认 64）有界排队，超限抛 `InferenceOverloadedException`
+  → 503 + `Retry-After`（错误码 `MODEL_SERVICE_BUSY`）；`/readyz` 新增 `queuedBatches`。
+- Practice 消费侧回归：非 200（含 503）→ ABSTAINED 路径，PracticeService 68 用例全绿。
+
+### T6 前端瘦身
+- manualChunks：@antv → knowledge-graph 独立 chunk（1392K→1380K，主包不变可缓存）。
+- 资产：bg/bg_1/bg2/bg3/bg4 PNG→WebP 合计 9.07MB→668KB（82–228KB/张）；bgm.mp3
+  96kbps 单声道 8.6MB→4.3MB；原 PNG 引用清零后删除。
+- 结构：api.ts 869→39 行薄门面（+8 域文件）；global.css 3358→6 文件（@import 保序，
+  构建产物选择器偏移单调递增）；ReviewPage 884→310 行（useGameRuntime/useAudioStage/
+  useStoryProgress + 3 展示组件）；credits 购买 URL 兜底移除（无配置即隐藏入口）。
+
+### T7 原生部署与文档
+- 核实 deploy-windows.ps1 为原生 Windows 部署（不使用 compose）；接入
+  `GALREVIEW_ADMIN_PRINCIPAL_ID`：初始化自动生成 GUID、`Assert-ProductionSettings` 必填、
+  AuthService/CreditService 进程环境注入——**消除 T2 fail-fast 对原生路径的回归**。
+- docs/windows-production.md 增加原生 vs compose 生产路径对照表；脚本拆模块延后（无部署
+  靶机可验证，转 P2）。
+
+### T8 双端治理
+- desktop：打包版必须显式 `GALREVIEW_GATEWAY_URL`（缺失弹窗退出）；开发态默认保留。
+- mobile：`cleartext:false`、`allowNavigation:[]`、`allowMixedContent:false`。
+- docs/desktop-release.md：签名材料生命周期（自签→CA、轮换、吊销、不入库）。
+- CI：新增 desktop（windows-latest，electron-builder --dir 未签名冒烟，前置 frontend
+  构建）与 mobile（temurin 17 + cap sync + gradlew assembleDebug）job，均带路径过滤。
+
+### 测试证据（本机）
+
+| 套件 | 结果 |
+|---|---|
+| FileService | 18/18 |
+| GalGameService | 362/362（含恢复签名变更后的 3 处断言更新） |
+| ModelService（单元，排除 Integration） | 4/4；ModelService.API 显式编译通过 |
+| PracticeService（T5 消费侧回归） | 68/68 |
+| Frontend vitest / typecheck / build | 11/11；0 错误；构建成功 |
+| desktop main.js `node --check`；ci.yml YAML 解析 | 通过；11 个 job |
+| deploy-windows.ps1 PowerShell AST 解析 | 通过 |
+
+## 45. 2026-10-14 P2 T11 前端 E2E 冒烟（Playwright）
+
+本节记录 T11「登录→建项目/进册→答一题→看结果」视口冒烟的落地证据。
+
+### 变更范围
+
+- 新增 `frontend/playwright.config.ts`：双视口项目 desktop-chromium（1280×720）与
+  mobile-chromium（375×667）；webServer 只起 Vite dev（端口 5123）。
+- 新增 `frontend/e2e/apiMocks.ts`：`page.route` 全量 mock `/api/v1/**`（auth/users/
+  materials/practice-projects/questions/knowledge-graphs/plans/practice-sessions），
+  返回 `{ data, meta, traceId }` 成功信封；不依赖真实后端。图谱归属
+  `studyProjectId` 跟随构图请求动态绑定，覆盖「立册→识网→成题」归属校验。
+- 新增 `frontend/e2e/smoke.spec.ts`：2 条用例 × 2 视口 = 4 个测试
+  ① 登录→进入研习册→开始温习→答一题→看结果→完成练习；
+  ② 登录→建立研习册（mock 识网/成题链路）→进入新册→答一题→看结果。
+- `frontend/package.json`：`test:e2e` 脚本 + `@playwright/test` devDependency。
+- CI `ci.yml`：新增可选 job `frontend-e2e`（`continue-on-error: true`，路径过滤
+  frontend/**，失败上传 playwright-report）；**稳定绿一周后转必需**。
+- `frontend/.gitignore`：忽略 `test-results/`、`playwright-report/`。
+- docs/optimization-roadmap.md T11 进度与 C3 状态更新。
+
+### 测试证据（本机 Windows）
+
+| 套件 | 结果 |
+|---|---|
+| Playwright E2E（desktop 1280×720 + mobile 375×667） | 4/4 通过（登录/进册/立册/答题/结果/完成） |
+| `playwright test --list` | 列出 4 条用例（2 场景 × 2 视口） |
+| Frontend vitest | 11/11 通过（未回归） |
+| Frontend typecheck（tsc -b） | 0 错误 |
+
+注：本机已执行 `npx playwright install chromium`；全新环境（含 CI）需先
+`npx playwright install`（CI 使用 `--with-deps chromium`），否则用例无法启动浏览器。
+
+### 选择器与稳定性决策
+
+- AppShell `PageHeader` 的 `<h1>` 在移动视口被 CSS 隐藏，断言改用 URL +
+  两种视口均可见的正文元素（`续读旧卷` / `本次温习范围` / 题干 h2）。
+- FormField 清除按钮 `aria-label` 含「邮箱/密码」，登录输入改用
+  `input[name="email"|"password"]` 定位，避免 getByLabel 严格模式冲突。
+- 全部 API mock 带兜底 404 显式失败，防止未覆盖接口静默假绿。
+
+### 遗留
+
+- E2E 当前为 mock 冒烟，不覆盖真实后端契约；真实链路集成 E2E 需另立任务。
+- CI `frontend-e2e` 仍为可选（continue-on-error）；稳定绿一周后转必需。
+
+## 46. 2026-10-14 P2 T12 测试盲区补齐（File/Credit/OCR）
+
+本节恢复 test_report.md 更新纪律并记录 T12 交付证据：FileService 测试扩到 10 个
+测试文件、CreditService 并发扣减/兑换码防重放用例、OCR 最小契约测试。
+
+### 变更范围
+
+**FileService（Tests/，10 个 .cs 测试文件，≥8 达标）**
+
+| 文件 | 覆盖 |
+|---|---|
+| `InternalServiceAccessPolicyTests.cs` | 网关信任头、allowlist（既有） |
+| `ParserInputPolicyTests.cs` | 支持/不支持输入、解析器分派（既有） |
+| `ApiEnvelopeTests.cs` | ApiSuccess/ApiFailure 信封形状、契约错误码串稳定性 |
+| `FileTextContractValidatorTests.cs` | sourceMap 有序不重叠、block 文本逐字一致、空文本拒绝 |
+| `IngestionQueueTests.cs` | FIFO、TryRead、Complete 后拒收、并发写入去重 |
+| `LocalFileStoreTests.cs` | 内容路径映射 `contentRoot/{materialId}.bin`、SHA-256 小写、文件名剥离目录段、分页 cursor、软删除/属主 |
+| `IngestionJobLifecycleTests.cs` | QUEUED→PROCESSING 置位、text/* 成功发布 READY（NFC/LF）、失败 `MATERIAL_TEXT_EXTRACTION_FAILED` 信封、`TryRequeueForRetry` 重排/死信 |
+| `MediaPathMappingTests.cs` | DetectMediaType 扩展名→MIME 映射、显式 Content-Type 优先、GridFS ObjectId ↔ ContentPath 往返 |
+| `OcrResponseContractTests.cs` | OcrResponse/OcrPage/OcrProgress JSON 形状（含大小写不敏感）、OcrUsed 标志 |
+| `UploadLimitAndIdPathTests.cs` | 10 MiB 上限契约值、带 charset 的 Content-Type 解析、MIME 压过扩展名、subjectCode 正则、路径穿越剥离 |
+
+辅助：`TestSupport.cs`（内存 IFormFile / TestHostEnvironment，不起真实 Mongo）。
+
+**CreditService（CreditService.Tests/）**
+
+- `CreditConcurrencyTests.cs`（6 用例）：并发 Reserve 不透支（32 并发抢 40k 预授权，
+  余额/可用/冻结精确匹配）、并发 Settle/Release 不重复记账、同 operationId 并发
+  Reserve 幂等不双冻结、超预授权 Settle 抛 `CREDIT_ESTIMATE_EXCEEDED`。
+- `CreditRedeemReplayTests.cs`（9 用例）：同码串行二次兑换 422 `REDEMPTION_CODE_UNAVAILABLE`；
+  8 用户并发抢同一码恰好 1 人成功；5 码×4 并发抢兑余额精确累加；撤销/过期/未知码拒绝；
+  大小写与空白归一化；空/超长码 `VALIDATION_ERROR`。
+
+**OCRService（tests/test_contract.py，16 用例）**
+
+- 方式：pytest（亦兼容 `python -m unittest tests.test_contract`）；import 前对
+  `fitz`/`paddleocr` 注入桩模块，**不加载真实 OCR 模型**；固定 1×1 PNG 样例图 +
+  mock `recognize_text_regions` 断言期望文本 `["Hello","GalReview"]`。
+- 覆盖：`/healthz` 免鉴权返回 `{"status":"live"}`；缺/错 `X-Gateway-Key` 401 detail
+  信封；非法媒体类型 415、非法 OCR mode 400、超 10 MB 413；PNG/JPEG 魔数识别；
+  quick 模式跳过公式阶段；任务进度 UNKNOWN 形状、取消 202+CANCELLED、
+  `ensure_not_cancelled` 409；`is_choice_label`/`rect`/`result_to_payload` 纯函数。
+- 显式测契约（API 形状、错误码），不测 OCR 识别精度。
+
+### 测试证据（本机）
+
+| 套件 | 结果 |
+|---|---|
+| FileService（dotnet test） | 104/104 通过 |
+| CreditService（dotnet test） | 22/22 通过（原 7 + 新增 15） |
+| OCRService（pytest） | 16/16 通过 |
+| OCRService（unittest 复核） | 16/16 通过 |
+
+注：本机 `dotnet test` 需先按 docs/nuget-windows-fix.md 设置
+`ProgramFiles(x86)`/`ProgramW6432` 进程环境变量，否则 NuGet restore 抛
+`ConfigurationDefaults` 异常。Python 侧需 `pytest fastapi httpx python-multipart`
+（`$env:MIMO_PYTHON -m pip install`）。
+
+### 遗留
+
+- FileService `MongoFileStore.RecoverIncompleteJobsAsync` 的启动恢复语义仍依赖真实
+  Mongo，本轮仅覆盖 `TryRequeueForRetry` 死信契约；Mongo 恢复路径待集成测试。
+- OCR 真实识别精度/资源上限仍未验证（contract.md §5.4 URGENT 项不变）。
+- CreditService 并发用例基于 MemoryCreditRepository；MySQL 仓储的
+  `FOR UPDATE` 行为需集成环境复核（含 code 掩码 `"****"+suffix` 语义）。
+
+---
+
+## 47. 2026-09-30 P2 T10 可观测性深化（JSON 日志/透传/告警）
+
+本节记录 T10「跨服务排障一次定位；核心指标有告警」的实施与本地验证。
+规范文档见 `docs/observability.md`（含指标清单、告警阈值、PromQL 伪查询、Auth/GalGame 接入清单）。
+
+### 变更范围
+
+**JSON 结构化日志（六服务，每服务一个小文件 + Program 2–4 行接入）**
+
+| 服务 | 新文件 | Program 接入 |
+|---|---|---|
+| UserService | `RequestLogging.cs` | `AddJsonStructuredLogging()` + `UseRequestLogging("UserService")`（替换原内联 correlation 中间件） |
+| FileService | `RequestLogging.cs` | 同上；`/readyz` 增报 `ingestionQueueDepth` |
+| PracticeService.API | `RequestLogging.cs` + `MetricsEndpoints.cs` | 同上 + `MapServiceMetrics()`（`/metrics`） |
+| CreditService.API | `RequestLogging.cs` | 压缩风格接入；`/metrics` 端点 |
+| KnowledgeService.API | `Infrastructure/RequestLogging.cs` | 挂在既有 `TraceContextMiddleware` 之后 |
+| ModelService.API | `RequestLogging.cs` | 含 X-Correlation-Id 归一（原先缺失入站中间件） |
+
+日志格式：`AddJsonConsole`（UTC 时间戳、scopes 开启）；每请求 BeginScope(traceId/userId/path/method)，
+收尾 `LogInformation` 带 `durationMs`/`status`/`traceId`/`userId`。错误信封 ApiFailure/ApiSuccess 结构未改动。
+
+**X-Correlation-Id 跨服务透传**
+
+- 补缺：Practice `GatewayClient.Create` 与 `GatewayModelFacetAdjudicator` 出站请求
+  经 `TraceFlow`（AsyncLocal，`PracticeService.Persistence/TraceFlow.cs`）透传
+  `X-Correlation-Id`；请求中间件写入 TraceFlow，后台任务未设置时客户端生成新 id。
+- 核对通过：Knowledge `GatewayMaterialTextClient`/`GatewayStudyProjectScopeClient`、
+  Auth `AuthGatewayClient`（方法参数显式透传）、Gateway proxy（`createProxy.ts`）。
+- Practice/Model 入站归一：缺失的 X-Correlation-Id 中间件由 `RequestLogging` 承担
+  （≤128 长度校验，回写响应头）。
+
+**告警最低集信号**
+
+| 指标 | 位置 | 来源 |
+|---|---|---|
+| `gateway_upstream_failures_total{service,kind}` | Gateway `/metrics` | proxy 错误回调（timeout/connection/contract/other） |
+| `practice_abstained_total` / `practice_gradings_total` / `practice_degraded_total` | Practice `/metrics` | `AutomaticAnswerScoring.Result` 计数 |
+| `credit_release_failures_total` | Credit `/metrics` | `CreditHandlers.Handle(ReleaseCreditsCommand)` 异常计数 |
+| `ingestionQueueDepth` | FileService `/readyz` | `IngestionQueue.Reader.Count` |
+| `queuedBatches` | ModelService `/readyz` | 既有 `InferenceLoadSnapshot`（未改） |
+
+告警规则（readyz 下游异常 >5min、ABSTAINED 突增、Credit 释放失败、队列深度）
+写在 `docs/observability.md` §3，含建议阈值与 PromQL 伪查询。
+
+### 测试证据（本机 Windows）
+
+| 套件 | 结果 |
+|---|---|
+| Gateway vitest | 220/220 通过（基线 216 + 新增 4：upstream failure 计数、proxy 透传 X-Correlation-Id、metrics 渲染） |
+| Gateway `tsc`（npm run build） | 0 错误 |
+| `dotnet build` User/File/Practice.API/Credit.API/Knowledge.API/Model.API | 6/6 成功，0 警告 0 错误 |
+| PracticeService.Tests | 68/68 通过 |
+| CreditService.Tests（CreditFlowTests，既有跟踪用例） | 7/7 通过 |
+| UserService Tests | 32/32 通过 |
+
+注：CreditService.Tests 中另有 2 条**未跟踪新用例**（`CreditConcurrencyTests` /
+`CreditRedeemReplayTests`，属 T12 在途工作）失败——断言 code 掩码 `****` 与并发账本，
+与 T10 改动无关（T10 仅在 `Handle(ReleaseCreditsCommand)` 外包 try/catch 计数后原样 rethrow）。
+
+### 透传验收路径
+
+Gateway（traceContext 生成/清洗/回写）→ proxy 注入 `X-Correlation-Id` →
+Practice `RequestLogging` 归一 + `TraceFlow` → 出站 GatewayClient（Credit 预授权/结算/释放）与
+GatewayModelFacetAdjudicator（Model 判分）同 traceId → 各服务 JSON 日志与错误信封 `traceId` 同源。
+一次注入故障（如断 Model 端口）可凭响应头 traceId 在 Gateway/Practice/Model/Credit 日志串起。
+
+### 遗留
+
+- AuthService / GalGameService 未改（另一代理正在拆分其 Program.cs）；
+  接入清单 3–5 行改动见 `docs/observability.md` §5，拆分完成后执行。
+- ABSTAINED 率告警依赖抓取端采集 `/metrics`；当前为进程内单实例计数（重启清零）。
+- Model `queuedBatches` / File `ingestionQueueDepth` 在 `/readyz` JSON 中，需探针转指标或侧车采集后才能进 PromQL。
+
+## 48. 2026-10-14 P2 T9 单体拆分 + T10 Auth/GalGame 可观测接入收尾
+
+本节记录 P2 最后一批工程化变更：T9 三个大文件拆分，以及 T10 在 Auth/GalGame 的可观测接入（T9 落地后补做）。
+
+### T9 · 后端单体拆分（行为零改动，测试锁）
+
+| 目标 | 拆前 | 拆后 | 新模块 |
+|---|---|---|---|
+| `AuthService/Program.cs` | 579 | **122** | `AuthContracts` / `AuthRepositories` / `AuthRegistrationEndpoints` / `AuthSessionEndpoints` / `AuthPasswordEndpoints` / `AuthAdminEndpoints` / `AuthIntrospectionEndpoints` |
+| `GalGameService/Program.cs` | 528 | **184** | `GameGenerationEndpoints` / `GalGameStartupRecovery` / `GalGameMiddleware` |
+| `ReciteQuestionGenerator.cs` | 682 | **116** | `GroundedQuestionExtractor` / `ModelQuestionClient` / `QuestionTextParser` / `QuestionChunker` |
+
+**回归**：AuthService.Tests 18/18；GalGameService.Tests 362/362（含 `WebApplicationFactory` 集成）；PracticeService.Tests 68/68（含 ReciteQuestionGeneratorTests）。
+**适配**：仅 `AuthAdminCredentials` options record、static 委托改直呼 `AuthHttp`/`GalGameHttp`、少量 `internal` 可见性提升——契约/状态码/错误码零改动。
+
+### T10 收尾 · Auth/GalGame 可观测接入
+
+| 服务 | 变更 |
+|---|---|
+| AuthService | `RequestLogging.cs`；`AddJsonStructuredLogging()`；correlation 中间件 → `UseRequestLogging("AuthService")` |
+| GalGameService | `RequestLogging.cs` + `GalGameTraceFlow.cs`；保留 `UseGalGameCorrelationId`（严格字符集）+ `UseRequestLogging(..., normalizeCorrelationId: false)`；`BeginAmbientTrace` 注册 |
+| GalGame 出站 | `CreditBillingClient` 补 `X-Correlation-Id`（`GalGameTraceFlow.Current`）；`generationWork` 执行时 `Begin(traceId)`，后台任务可串联 |
+| 共享 | `RequestLogging.BeginAmbientTrace` 钩子（Practice `TraceFlow` / GalGame `GalGameTraceFlow` 共用接入点） |
+
+### 测试证据（2026-10-14 本地实跑）
+
+| 套件 | 结果 |
+|---|---|
+| AuthService.Tests | 18/18 |
+| GalGameService.Tests | 362/362 |
+| PracticeService.Tests | 68/68 |
+| CreditService.Tests | 22/22（含 T12 并发/防重放） |
+| FileService.Tests | 104/104（10 文件） |
+| Gateway vitest | 220/220 |
+| dotnet build（Auth/GalGame/Practice/Credit/File/User） | 全部 0 警告 0 错误 |
+
+**遗留（非阻塞）**：Playwright E2E CI job 仍为可选（稳定一周后转必需）；MongoFileStore 启动恢复集成测试与 OCR 真机精度验证见 T12 遗留清单；GalGame `generationQueueDepth` readyz 指标为可选增强。

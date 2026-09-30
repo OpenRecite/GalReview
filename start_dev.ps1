@@ -282,6 +282,9 @@ function Start-MoonStoneStack {
     $env:GATEWAY_PORT = [string]$gatewayPort
     $env:GATEWAY_HOST = '127.0.0.1'
     $env:GATEWAY_URL = $gatewayBaseUrl
+    # 本地栈固定以 Development 运行；集成/生产环境由 compose 显式指定
+    $env:ASPNETCORE_ENVIRONMENT = 'Development'
+    $env:NODE_ENV = 'development'
 
     $gatewayRoot = Join-Path $projectRoot 'gateway'
     $renderServiceRoot = Join-Path $backendRoot 'RenderService\service'

@@ -20,6 +20,11 @@ public sealed class CreditBillingClient(IHttpClientFactory clients,IConfiguratio
     private async Task SendAsync(HttpMethod method,string path,object? body,CancellationToken ct)
     {
         using var request=new HttpRequestMessage(method,path);if(body is not null)request.Content=JsonContent.Create(body);request.Headers.TryAddWithoutValidation("X-Service-Name","GalGameService");request.Headers.TryAddWithoutValidation("X-Service-Key",ServiceKey);
+        var ambient = GalGameTraceFlow.Current;
+        if (!string.IsNullOrEmpty(ambient))
+            request.Headers.TryAddWithoutValidation("X-Correlation-Id", ambient);
+        else
+            request.Headers.TryAddWithoutValidation("X-Correlation-Id", Guid.NewGuid().ToString("N"));
         using var response=await clients.CreateClient("gateway").SendAsync(request,ct);var text=await response.Content.ReadAsStringAsync(ct);if(response.IsSuccessStatusCode)return;
         logger.LogWarning("CreditService call failed: {Status} {Body}",(int)response.StatusCode,text.Length>2000?text[..2000]:text);
         try{using var doc=JsonDocument.Parse(text);var error=doc.RootElement.GetProperty("error");throw new CreditBillingException((int)response.StatusCode,error.GetProperty("code").GetString()??"UPSTREAM_ERROR",error.GetProperty("message").GetString()??"credits 服务调用失败。",error.TryGetProperty("details",out var details)?details.Clone():new{});}catch(CreditBillingException){throw;}catch{throw new CreditBillingException((int)response.StatusCode,"UPSTREAM_ERROR","credits 服务调用失败。",new{});}

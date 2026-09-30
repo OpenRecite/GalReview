@@ -101,8 +101,10 @@ public sealed class AutomaticAnswerScorer(IFacetAdjudicator adjudicator) : IAnsw
         double? similarity,
         string judgeVersion,
         IReadOnlyList<FacetAssessment> facets,
-        bool degraded) =>
-        new(
+        bool degraded)
+    {
+        PracticeServiceMetrics.RecordGrading(decision.Status == GradingStatus.Abstained, degraded);
+        return new(
             decision.Status,
             decision.Outcome,
             decision.Correct,
@@ -113,6 +115,7 @@ public sealed class AutomaticAnswerScorer(IFacetAdjudicator adjudicator) : IAnsw
             decision.AbstainReason,
             facets,
             degraded);
+    }
 }
 
 public static partial class ReferenceFacetExtractor

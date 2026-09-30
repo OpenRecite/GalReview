@@ -1,0 +1,20 @@
+# 本地功能冒烟覆盖层：ModelService 用占位容器（缺 ONNX 资产），保证 Gateway 依赖可满足。
+# 用法：
+#   docker compose -f compose.integration.yaml -f compose.smoke.yaml up -d --build
+services:
+  model-service:
+    image: alpine:3.20
+    build: !reset null
+    command: ["sleep", "infinity"]
+    environment: !reset {}
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+    restart: unless-stopped
+
+  gateway:
+    environment:
+      READINESS_SERVICES: userService,authService,fileService,knowledgeService,galGameService,renderService,practiceService,creditService

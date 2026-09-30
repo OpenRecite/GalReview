@@ -1,0 +1,21 @@
+{
+  "appId": "cn.galreview.app",
+  "appName": "千知万理",
+  "webDir": "../frontend/dist",
+  "server": {
+    "androidScheme": "https",
+    "cleartext": false,
+    "allowNavigation": []
+  },
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#eef8fd"
+  },
+  "plugins": {
+    "SplashScreen": {
+      "backgroundColor": "#eef8fd",
+      "launchAutoHide": true,
+      "androidScaleType": "CENTER_CROP"
+    }
+  }
+}

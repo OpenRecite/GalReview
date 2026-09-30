@@ -49,7 +49,8 @@ public sealed record GameGenerationJob(
     string GeneratorVersion,
     ApiError? Error,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    int AttemptCount = 0);
 
 /// <summary>游戏包清单（GET /api/v1/game-packages/{packageId} 响应）</summary>
 public sealed record GamePackageManifest(
@@ -275,3 +276,6 @@ public static class InternalServiceAccessPolicy
             ?? Array.Empty<string?>();
     }
 }
+
+/// <summary>启动恢复结果：FAILED 数量与对应作业 ID（用于释放 HELD 预授权）。</summary>
+public sealed record GameStaleJobRecovery(int FailedCount, IReadOnlyList<Guid> FailedJobIds);

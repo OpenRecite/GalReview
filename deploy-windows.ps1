@@ -668,6 +668,19 @@ function Initialize-ProductionEnvironment {
             $generatedCount++
         }
     }
+    # 管理员 PrincipalId：Auth/Credit 共用的管理员身份 GUID，生产必须显式配置。
+    # 与服务密钥同机制自动生成，避免缺失时服务启动 fail-fast。
+    $principalPattern = '(?m)^GALREVIEW_ADMIN_PRINCIPAL_ID=(.*)$'
+    $principalMatch = [Regex]::Match($content, $principalPattern)
+    if (-not $principalMatch.Success) {
+        $content = $content.TrimEnd() + "`r`nGALREVIEW_ADMIN_PRINCIPAL_ID=$([guid]::NewGuid().ToString())`r`n"
+        $generatedCount++
+    }
+    elseif ([string]::IsNullOrWhiteSpace($principalMatch.Groups[1].Value.Trim()) -or $principalMatch.Groups[1].Value.Trim() -match 'CHANGE_ME') {
+        $content = [Regex]::Replace($content, $principalPattern, "GALREVIEW_ADMIN_PRINCIPAL_ID=$([guid]::NewGuid().ToString())")
+        $generatedCount++
+    }
+
     if ($generatedCount -gt 0) {
         Set-Content -LiteralPath $resolvedEnvironmentPath -Value $content -Encoding utf8 -NoNewline
     }
@@ -876,6 +889,7 @@ function Assert-ProductionSettings {
         'PRACTICE_SERVICE_KEY', 'CREDIT_SERVICE_KEY', 'MODEL_SERVICE_KEY', 'USER_DATABASE_CONNECTION',
         'AUTH_DATABASE_CONNECTION', 'CREDIT_DATABASE_CONNECTION', 'MONGO_CONNECTION_STRING',
         'NEO4J_PASSWORD', 'GALREVIEW_ADMIN_USERNAME', 'GALREVIEW_ADMIN_PASSWORD_HASH',
+        'GALREVIEW_ADMIN_PRINCIPAL_ID',
         'ACCOUNT_FRONTEND_BASE_URL', 'CORS_ORIGINS'
     )
 
@@ -1438,7 +1452,7 @@ function Start-ProductionServices {
         $serviceDefinitions = @(
             @{
                 Name = 'credit-service'; File = Join-Path $releaseRoot 'services\credit-service\CreditService.API.exe'; Work = Join-Path $releaseRoot 'services\credit-service'; Health = 'http://127.0.0.1:5108/readyz';
-                Env = $commonAspNet + @{ ASPNETCORE_URLS = 'http://127.0.0.1:5108'; Gateway__ServiceKey = Get-Setting 'CREDIT_SERVICE_KEY'; ConnectionStrings__CreditDatabase = Get-Setting 'CREDIT_DATABASE_CONNECTION'; CreditStore__Provider = 'MySQL' }
+                Env = $commonAspNet + @{ ASPNETCORE_URLS = 'http://127.0.0.1:5108'; Gateway__ServiceKey = Get-Setting 'CREDIT_SERVICE_KEY'; Admin__PrincipalId = Get-Setting 'GALREVIEW_ADMIN_PRINCIPAL_ID'; ConnectionStrings__CreditDatabase = Get-Setting 'CREDIT_DATABASE_CONNECTION'; CreditStore__Provider = 'MySQL' }
             },
             @{
                 Name = 'user-service'; File = Join-Path $releaseRoot 'services\user-service\GalGame.UserService.exe'; Work = Join-Path $releaseRoot 'services\user-service'; Health = 'http://127.0.0.1:5101/readyz';
@@ -1470,7 +1484,7 @@ function Start-ProductionServices {
             },
             @{
                 Name = 'auth-service'; File = Join-Path $releaseRoot 'services\auth-service\GalGame.AuthService.exe'; Work = Join-Path $releaseRoot 'services\auth-service'; Health = 'http://127.0.0.1:5102/readyz';
-                Env = $commonAspNet + @{ ASPNETCORE_URLS = 'http://127.0.0.1:5102'; MOONSTONE_MODE = Get-Setting 'AUTH_SERVICE_MODE' 'MySql'; Gateway__BaseUrl = $gatewayBaseUrl; Gateway__ServiceKey = Get-Setting 'AUTH_SERVICE_KEY'; Admin__Username = Get-Setting 'GALREVIEW_ADMIN_USERNAME'; Admin__PasswordHash = Get-Setting 'GALREVIEW_ADMIN_PASSWORD_HASH'; Email__SmtpHost = Get-Setting 'SMTP_HOST'; Email__SmtpPort = Get-Setting 'SMTP_PORT' '465'; Email__UseSsl = Get-Setting 'SMTP_USE_SSL' 'true'; Email__Username = Get-Setting 'SMTP_USERNAME'; Email__Password = Get-Setting 'SMTP_PASSWORD'; Email__FromAddress = Get-Setting 'SMTP_FROM_ADDRESS'; Email__FromName = Get-Setting 'SMTP_FROM_NAME' '千知万理'; AccountFrontend__BaseUrl = Get-Setting 'ACCOUNT_FRONTEND_BASE_URL'; ConnectionStrings__AuthDatabase = Get-Setting 'AUTH_DATABASE_CONNECTION' }
+                Env = $commonAspNet + @{ ASPNETCORE_URLS = 'http://127.0.0.1:5102'; MOONSTONE_MODE = Get-Setting 'AUTH_SERVICE_MODE' 'MySql'; Gateway__BaseUrl = $gatewayBaseUrl; Gateway__ServiceKey = Get-Setting 'AUTH_SERVICE_KEY'; Admin__Username = Get-Setting 'GALREVIEW_ADMIN_USERNAME'; Admin__PasswordHash = Get-Setting 'GALREVIEW_ADMIN_PASSWORD_HASH'; Admin__PrincipalId = Get-Setting 'GALREVIEW_ADMIN_PRINCIPAL_ID'; Email__SmtpHost = Get-Setting 'SMTP_HOST'; Email__SmtpPort = Get-Setting 'SMTP_PORT' '465'; Email__UseSsl = Get-Setting 'SMTP_USE_SSL' 'true'; Email__Username = Get-Setting 'SMTP_USERNAME'; Email__Password = Get-Setting 'SMTP_PASSWORD'; Email__FromAddress = Get-Setting 'SMTP_FROM_ADDRESS'; Email__FromName = Get-Setting 'SMTP_FROM_NAME' '千知万理'; AccountFrontend__BaseUrl = Get-Setting 'ACCOUNT_FRONTEND_BASE_URL'; ConnectionStrings__AuthDatabase = Get-Setting 'AUTH_DATABASE_CONNECTION' }
             }
         )
 

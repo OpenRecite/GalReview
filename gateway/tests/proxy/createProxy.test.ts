@@ -22,7 +22,11 @@ const mockConfig: GatewayConfig = {
     renderService: { name: 'RenderService', url: 'http://localhost:5106' },
     practiceService: { name: 'PracticeService', url: 'http://localhost:5107' },
   },
-  rateLimit: {
+  introspectionCache: {
+    positiveTtlMs: 30_000,
+    negativeTtlMs: 5_000,
+    maxEntries: 10_000,
+  },  rateLimit: {
     anonymous: { windowMs: 60000, max: 20 },
     upload: { windowMs: 60000, max: 10 },
     generation: { windowMs: 60000, max: 5 },
@@ -133,7 +137,9 @@ describe('createProxyForRoute', () => {
 
   it('上游连接失败应返回 503 SERVICE_UNAVAILABLE', async () => {
     const unavailableOrigin = await reserveUnavailableOrigin();
-    const app = createProxyTestApp(unavailableOrigin, 1_000, 'proxy-connection-trace');
+    const failures: Array<{ service: string; kind: string }> = [];
+    const app = createProxyTestApp(unavailableOrigin, 1_000, 'proxy-connection-trace', (service, kind) =>
+      failures.push({ service, kind }));
 
     const response = await request(app).get('/api/v1/users/me');
 
@@ -146,6 +152,31 @@ describe('createProxyForRoute', () => {
       },
       traceId: 'proxy-connection-trace',
     });
+    // 告警信号：上游失败按 service/kind 计数
+    expect(failures).toEqual([{ service: 'userService', kind: 'connection' }]);
+  });
+
+  it('应向下游透传 X-Correlation-Id', async () => {
+    const upstream = await startUpstream();
+    try {
+      const app = express();
+      const route: RouteEntry = {
+        path: '/api/v1/users',
+        service: 'userService',
+        auth: 'user',
+        rateLimitCategory: 'general',
+      };
+      app.use((req, _res, next) => {
+        req.traceId = 'trace-through-proxy';
+        next();
+      });
+      app.use(route.path, createProxyForRoute(route, configFor(upstream.origin)));
+
+      await request(app).get('/api/v1/users/me');
+      expect(await upstream.correlationId).toBe('trace-through-proxy');
+    } finally {
+      await closeServer(upstream.server);
+    }
   });
 
   it('上游响应超时应返回 503 SERVICE_UNAVAILABLE', async () => {
@@ -207,6 +238,7 @@ function createProxyTestApp(
   userServiceUrl: string,
   timeoutMs: number,
   traceId: string,
+  onUpstreamFailure?: (service: string, kind: string) => void,
 ): express.Express {
   const app = express();
   const route: RouteEntry = {
@@ -224,22 +256,25 @@ function createProxyTestApp(
     createProxyForRoute(route, {
       ...configFor(userServiceUrl),
       defaultTimeoutMs: timeoutMs,
-    }),
+    }, onUpstreamFailure),
   );
   return app;
 }
 
-async function startUpstream(): Promise<{ server: Server; origin: string; requestUrl: Promise<string> }> {
+async function startUpstream(): Promise<{ server: Server; origin: string; requestUrl: Promise<string>; correlationId: Promise<string> }> {
   let resolveRequestUrl!: (value: string) => void;
   const requestUrl = new Promise<string>((resolve) => { resolveRequestUrl = resolve; });
+  let resolveCorrelationId!: (value: string) => void;
+  const correlationId = new Promise<string>((resolve) => { resolveCorrelationId = resolve; });
   const server = createServer((incoming, response) => {
     resolveRequestUrl(incoming.url ?? '/');
+    resolveCorrelationId(String(incoming.headers['x-correlation-id'] ?? ''));
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end('{"ok":true}');
   });
 
   const origin = await listenOnTestPort(server);
-  return { server, origin, requestUrl };
+  return { server, origin, requestUrl, correlationId };
 }
 
 async function startHangingUpstream(): Promise<{ server: Server; origin: string }> {

@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router'
 import AppShell, { PageHeader } from '../components/AppShell'
 import { api } from '../lib/api'
+import { resolvePurchaseUrl } from '../lib/credits'
 import { clearSession, readProfile, saveProfile } from '../lib/session'
 import { readReducedMotion, saveReducedMotion } from '../lib/theme'
 import { resetWorkflow } from '../lib/workflow'
@@ -70,7 +71,11 @@ export default function SettingsPage() {
   }
 
   function openPurchase() {
-    if (window.confirm('将前往购买页面。购买后请返回此处输入兑换码，是否继续？')) window.location.assign('https://pay.ldxp.cn/shop/7CX09W5E')
+    const purchaseUrl = resolvePurchaseUrl()
+    if (!purchaseUrl) return
+    if (window.confirm('将前往购买页面。购买后请返回此处输入兑换码，是否继续？')) {
+      window.location.assign(purchaseUrl)
+    }
   }
 
   async function submitProfile(event: FormEvent) {
@@ -174,7 +179,7 @@ export default function SettingsPage() {
                 <div className="credits-redeem__copy"><h3 id="credits-redeem-title">兑换 Credits</h3><p>输入兑换码后，额度会立即加入当前账户。</p></div>
                 <div className="credits-redeem__controls">
                   <label><span>兑换码</span><input autoComplete="off" placeholder="输入兑换码" value={redemptionCode} onChange={(event) => setRedemptionCode(event.target.value.toUpperCase())} /></label>
-                  <div className="credits-redeem__actions"><button className="button button--primary" disabled={busy !== null || !redemptionCode.trim()} type="submit">立即兑换</button><button className="button button--quiet" type="button" onClick={openPurchase}>购买 credits</button></div>
+                  <div className="credits-redeem__actions"><button className="button button--primary" disabled={busy !== null || !redemptionCode.trim()} type="submit">立即兑换</button>{resolvePurchaseUrl() ? <button className="button button--quiet" type="button" onClick={openPurchase}>购买 credits</button> : null}</div>
                 </div>
               </section>
             </form>

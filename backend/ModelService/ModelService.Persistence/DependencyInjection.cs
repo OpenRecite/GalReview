@@ -18,7 +18,11 @@ public static class DependencyInjection
         services.AddSingleton(new ModelAssetCatalog(resourceRoot));
         services.AddSingleton<IModelAssetStatusReader>(provider =>
             provider.GetRequiredService<ModelAssetCatalog>());
-        services.AddSingleton<IFacetInferenceEngine, MultilingualNliInferenceEngine>();
+        services.AddSingleton<MultilingualNliInferenceEngine>();
+        services.AddSingleton<IFacetInferenceEngine>(provider =>
+            provider.GetRequiredService<MultilingualNliInferenceEngine>());
+        services.AddSingleton<IInferenceLoadStats>(provider =>
+            provider.GetRequiredService<MultilingualNliInferenceEngine>());
         return services;
     }
 }

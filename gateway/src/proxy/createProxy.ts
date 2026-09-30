@@ -71,10 +71,12 @@ const ERROR_MAP: Record<ProxyErrorKind, [number, string, string]> = {
  * - 剥离敏感请求头（Authorization、X-Service-Key），防止凭证泄露
  * - 配置超时
  * - 写操作不盲目重试；GET 仅在确认幂等时有限重试
+ * - 上游失败时回调 onUpstreamFailure（供 metrics 计数告警）
  */
 export function createProxyForRoute(
   route: RouteEntry,
   config: GatewayConfig,
+  onUpstreamFailure?: (service: string, kind: string) => void,
 ): RequestHandler {
   const target = config.services[route.service];
   if (!target) {
@@ -167,6 +169,7 @@ export function createProxyForRoute(
           code: proxyError.code ?? 'UNKNOWN',
           status,
         }));
+        onUpstreamFailure?.(route.service, kind);
 
         const payload = JSON.stringify(buildApiFailure(errorCode, message, traceId));
         // 显式 Content-Length：避免 chunked 编码下客户端需等待终结块才能

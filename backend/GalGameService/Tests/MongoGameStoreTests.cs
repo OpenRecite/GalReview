@@ -326,7 +326,7 @@ public class MongoGameStoreTests : IDisposable
         });
 
         var recovered = _store.RecoverStaleJobs();
-        Assert.True(recovered >= 1);
+        Assert.True(recovered.FailedCount >= 1);
 
         var recoveredJob = _store.GetJob(job.GenerationId);
         Assert.NotNull(recoveredJob);
@@ -343,7 +343,7 @@ public class MongoGameStoreTests : IDisposable
         var job = _store.CreateJob("user-recover-2", CreateRequest());
 
         var recovered = _store.RecoverStaleJobs();
-        Assert.True(recovered >= 1);
+        Assert.True(recovered.FailedCount >= 1);
 
         var recoveredJob = _store.GetJob(job.GenerationId);
         Assert.NotNull(recoveredJob);
@@ -386,7 +386,7 @@ public class MongoGameStoreTests : IDisposable
         _store.RecoverStaleJobs();
 
         var recovered = _store.RecoverStaleJobs();
-        Assert.Equal(0, recovered);
+        Assert.Equal(0, recovered.FailedCount);
     }
 
     [Fact]
@@ -403,9 +403,9 @@ public class MongoGameStoreTests : IDisposable
         });
 
         var firstRecovery = _store.RecoverStaleJobs();
-        Assert.True(firstRecovery >= 1);
+        Assert.True(firstRecovery.FailedCount >= 1);
 
         var secondRecovery = _store.RecoverStaleJobs();
-        Assert.Equal(0, secondRecovery);
+        Assert.Equal(0, secondRecovery.FailedCount);
     }
 }

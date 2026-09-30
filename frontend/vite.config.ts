@@ -24,6 +24,15 @@ export default defineConfig({
   plugins: [react(), serveDevelopmentWikiIndex()],
   build: {
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        // @antv/g6 体积巨大（~1.4MB minified），仅 KnowledgeDag.tsx 使用。
+        // 拆成独立 chunk，避免其依赖被合并进主包，也让浏览器可独立缓存。
+        manualChunks(id: string) {
+          if (id.includes('@antv')) return 'knowledge-graph'
+        },
+      },
+    },
   },
   server: {
     host: '0.0.0.0',

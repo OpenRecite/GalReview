@@ -58,6 +58,29 @@ Gateway 配置、请求头或日志。
 - `Authorization` 不透传给业务服务，`Idempotency-Key` 和
   `X-Correlation-Id` 按契约保留。
 
+## 水平扩展约束（必读）
+
+当前实现的两项状态均在**进程内存**中：
+
+| 能力 | 存储 | 多实例后果 |
+|---|---|---|
+| 限流（`express-rate-limit`） | 内存 Map | 每实例独立配额，N 副本 ≈ N 倍攻击面 |
+| 令牌内省缓存 | 内存 LRU | 仅影响命中率，语义仍正确 |
+
+**因此：Gateway 当前部署目标是单实例。** 需要水平扩展时：
+
+1. 限流改为 Redis store（或等价共享存储）后再扩副本；
+2. 内省缓存可保持本地，但需接受吊销延迟 = TTL × 副本无关；
+3. `/metrics` 也是进程内计数，扩展后需按实例 scrape 或上聚合。
+
+Compose 与 Windows 生产脚本均按单 Gateway 实例编写；不要直接 `docker compose up --scale gateway=2`。
+
+## 可观测性
+
+- `GET /healthz`：存活探针。
+- `GET /readyz`：探测下游 `/healthz`。
+- `GET /metrics`：Prometheus 文本（请求数、状态码、时延和、内省缓存命中/未命中）。默认仅应从内网或本机 scrape。
+
 ## 容器
 
 ```powershell

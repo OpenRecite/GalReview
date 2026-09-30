@@ -436,3 +436,16 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# --- GalReview 本地构建产物与签名材料（勿提交） ---
+# 发布产物打包目录（含 APK / 安装包 / credit-codes.txt）
+/dist/
+/tmp/
+# Electron 桌面端
+/desktop/dist-installer/
+/desktop/build/*.cer
+# Android 签名材料与本地配置（密码在 keystore.properties，绝不入库）
+/mobile/android/keystore.properties
+/mobile/android/*.keystore
+/mobile/android/app/*.keystore
+/mobile/android/app/*.jks

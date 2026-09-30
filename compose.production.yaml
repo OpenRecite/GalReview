@@ -1,0 +1,102 @@
+# 生产覆盖层。用法：
+#   docker compose -f compose.integration.yaml -f compose.production.yaml up -d
+# 必须先按 .env.deploy.example 准备 .env（禁止 CHANGE_ME，禁止默认密钥）。
+# 本地联调请只用 compose.integration.yaml，不要叠加本文件。
+
+name: ${COMPOSE_PROJECT_NAME:-galreview-production}
+
+services:
+  user-mysql:
+    environment:
+      MYSQL_ROOT_PASSWORD: ${USER_MYSQL_ROOT_PASSWORD:?USER_MYSQL_ROOT_PASSWORD is required in production}
+      MYSQL_PASSWORD: ${USER_MYSQL_PASSWORD:?USER_MYSQL_PASSWORD is required in production}
+
+  auth-mysql:
+    environment:
+      MYSQL_ROOT_PASSWORD: ${AUTH_MYSQL_ROOT_PASSWORD:?AUTH_MYSQL_ROOT_PASSWORD is required in production}
+      MYSQL_PASSWORD: ${AUTH_MYSQL_PASSWORD:?AUTH_MYSQL_PASSWORD is required in production}
+
+  credit-mysql:
+    environment:
+      MYSQL_ROOT_PASSWORD: ${CREDIT_MYSQL_ROOT_PASSWORD:?CREDIT_MYSQL_ROOT_PASSWORD is required in production}
+      MYSQL_PASSWORD: ${CREDIT_MYSQL_PASSWORD:?CREDIT_MYSQL_PASSWORD is required in production}
+
+  neo4j:
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?NEO4J_PASSWORD is required in production}
+      HEALTHCHECK_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD is required in production}
+
+  user-service:
+    environment:
+      # 生产禁止 Mock 内存库
+      MOONSTONE_MODE: MySql
+      Gateway__ServiceKey: ${USER_SERVICE_KEY:?USER_SERVICE_KEY is required in production}
+      ConnectionStrings__UserDatabase: "Server=user-mysql;Port=3306;Database=galreview_user;User ID=galreview_user;Password=${USER_MYSQL_PASSWORD:?USER_MYSQL_PASSWORD is required in production};SslMode=Disabled;AllowPublicKeyRetrieval=True"
+
+  auth-service:
+    environment:
+      MOONSTONE_MODE: MySql
+      Gateway__ServiceKey: ${AUTH_SERVICE_KEY:?AUTH_SERVICE_KEY is required in production}
+      Admin__Username: ${GALREVIEW_ADMIN_USERNAME:?GALREVIEW_ADMIN_USERNAME is required in production}
+      Admin__PasswordHash: ${GALREVIEW_ADMIN_PASSWORD_HASH:?GALREVIEW_ADMIN_PASSWORD_HASH is required in production}
+      Admin__PrincipalId: ${GALREVIEW_ADMIN_PRINCIPAL_ID:?GALREVIEW_ADMIN_PRINCIPAL_ID is required in production}
+      ConnectionStrings__AuthDatabase: "Server=auth-mysql;Port=3306;Database=galreview_auth;User ID=galreview_auth;Password=${AUTH_MYSQL_PASSWORD:?AUTH_MYSQL_PASSWORD is required in production};SslMode=Disabled;AllowPublicKeyRetrieval=True"
+
+  credit-service:
+    environment:
+      Gateway__ServiceKey: ${CREDIT_SERVICE_KEY:?CREDIT_SERVICE_KEY is required in production}
+      Admin__PrincipalId: ${GALREVIEW_ADMIN_PRINCIPAL_ID:?GALREVIEW_ADMIN_PRINCIPAL_ID is required in production}
+      ConnectionStrings__CreditDatabase: "Server=credit-mysql;Port=3306;Database=qzwl_credit;User ID=qzwl_credit;Password=${CREDIT_MYSQL_PASSWORD:?CREDIT_MYSQL_PASSWORD is required in production};SslMode=Disabled;AllowPublicKeyRetrieval=True"
+
+  file-service:
+    environment:
+      Gateway__ServiceKey: ${FILE_SERVICE_KEY:?FILE_SERVICE_KEY is required in production}
+
+  knowledge-service:
+    environment:
+      Neo4j__Password: ${NEO4J_PASSWORD:?NEO4J_PASSWORD is required in production}
+      GatewayMaterialText__ServiceKey: ${KNOWLEDGE_SERVICE_KEY:?KNOWLEDGE_SERVICE_KEY is required in production}
+      Gateway__ServiceKey: ${KNOWLEDGE_SERVICE_KEY:?KNOWLEDGE_SERVICE_KEY is required in production}
+
+  galgame-service:
+    environment:
+      Gateway__ServiceKey: ${GALGAME_SERVICE_KEY:?GALGAME_SERVICE_KEY is required in production}
+
+  render-service:
+    environment:
+      Gateway__ServiceKey: ${RENDER_SERVICE_KEY:?RENDER_SERVICE_KEY is required in production}
+
+  model-service:
+    environment:
+      Gateway__ServiceKey: ${MODEL_SERVICE_KEY:?MODEL_SERVICE_KEY is required in production}
+
+  practice-service:
+    environment:
+      Gateway__ServiceKey: ${PRACTICE_SERVICE_KEY:?PRACTICE_SERVICE_KEY is required in production}
+      QuestionGeneration__ApiKey: ${DEEPSEEK_API_KEY:-}
+
+  galgame-service:
+    environment:
+      Gateway__ServiceKey: ${GALGAME_SERVICE_KEY:?GALGAME_SERVICE_KEY is required in production}
+      # 生成能力依赖密钥；空值时叙事/语音会静默降级——由 Test-ProductionEnv 按开关校验
+      NarrativeGeneration__ApiKey: ${DEEPSEEK_API_KEY:-}
+      VoiceSynthesis__ApiKey: ${MIMO_API_KEY:-}
+
+  gateway:
+    environment:
+      GATEWAY_KEY: ${GATEWAY_KEY:?GATEWAY_KEY is required in production}
+      USER_SERVICE_KEY: ${USER_SERVICE_KEY:?USER_SERVICE_KEY is required in production}
+      AUTH_SERVICE_KEY: ${AUTH_SERVICE_KEY:?AUTH_SERVICE_KEY is required in production}
+      FILE_SERVICE_KEY: ${FILE_SERVICE_KEY:?FILE_SERVICE_KEY is required in production}
+      KNOWLEDGE_SERVICE_KEY: ${KNOWLEDGE_SERVICE_KEY:?KNOWLEDGE_SERVICE_KEY is required in production}
+      GALGAME_SERVICE_KEY: ${GALGAME_SERVICE_KEY:?GALGAME_SERVICE_KEY is required in production}
+      RENDER_SERVICE_KEY: ${RENDER_SERVICE_KEY:?RENDER_SERVICE_KEY is required in production}
+      PRACTICE_SERVICE_KEY: ${PRACTICE_SERVICE_KEY:?PRACTICE_SERVICE_KEY is required in production}
+      CREDIT_SERVICE_KEY: ${CREDIT_SERVICE_KEY:?CREDIT_SERVICE_KEY is required in production}
+      MODEL_SERVICE_KEY: ${MODEL_SERVICE_KEY:?MODEL_SERVICE_KEY is required in production}
+      # 生产默认不绑定诊断友好 CORS；用 .env 显式配置
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required in production}
+
+  ocr-service:
+    environment:
+      GATEWAY_KEY: ${FILE_SERVICE_KEY:?FILE_SERVICE_KEY is required in production}

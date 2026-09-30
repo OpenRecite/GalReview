@@ -213,6 +213,11 @@ function createConfig(
         serviceKey: 'model-key',
       },
     },
+    introspectionCache: {
+      positiveTtlMs: 30_000,
+      negativeTtlMs: 5_000,
+      maxEntries: 10_000,
+    },
     rateLimit: {
       anonymous: { windowMs: 60_000, max: 100 },
       upload: { windowMs: 60_000, max: 100 },

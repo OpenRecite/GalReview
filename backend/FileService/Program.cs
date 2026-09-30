@@ -1,12 +1,15 @@
-﻿using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
 using System.Security.Cryptography;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Logging.AddJsonStructuredLogging();
 builder.Services.Configure<Microsoft.AspNetCore.Routing.RouteHandlerOptions>(
     options => options.ThrowOnBadRequest = true);
 var gatewayKey = builder.Configuration["Gateway:ServiceKey"] ?? throw new InvalidOperationException("Gateway:ServiceKey must be configured.");
+if (builder.Environment.IsProduction() && string.Equals(gatewayKey, "moonstone-local-gateway-key", StringComparison.Ordinal))
+    throw new InvalidOperationException("Gateway:ServiceKey must be changed from the development default in production.");
 const long MaxFileSizeBytes = 10 * 1024 * 1024;
 const long MultipartOverheadBytes = 1024 * 1024;
 builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = MaxFileSizeBytes + MultipartOverheadBytes);
@@ -26,26 +29,10 @@ builder.Services.AddHttpClient("ocr", client =>
 }).ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { UseProxy = false });
 builder.Services.AddSingleton<MongoFileStore>();
 builder.Services.AddSingleton<IFileStore>(serviceProvider => serviceProvider.GetRequiredService<MongoFileStore>());
+builder.Services.AddSingleton<IngestionQueue>();
+builder.Services.AddHostedService<IngestionWorker>();
 var app = builder.Build();
-app.Lifetime.ApplicationStarted.Register(() =>
-{
-    _ = Task.Run(async () =>
-    {
-        try
-        {
-            await app.Services.GetRequiredService<MongoFileStore>().RecoverIncompleteJobsAsync(CancellationToken.None);
-        }
-        catch (Exception exception)
-        {
-            app.Logger.LogError(exception, "Failed to recover incomplete ingestion jobs.");
-        }
-    });
-});
-app.Use(async (context, next) =>
-{
-    context.TraceIdentifier = context.Request.Headers["X-Correlation-Id"].FirstOrDefault() is { Length: > 0 } id ? id : Guid.NewGuid().ToString("N");
-    context.Response.Headers["X-Correlation-Id"] = context.TraceIdentifier; await next();
-});
+app.UseRequestLogging("FileService");
 app.UseExceptionHandler(error => error.Run(context =>
 {
     var exception = context.Features.Get<IExceptionHandlerFeature>()?.Error;
@@ -59,8 +46,8 @@ app.UseExceptionHandler(error => error.Run(context =>
     return Failure(context, 500, "INTERNAL_ERROR", "File service is temporarily unavailable.").ExecuteAsync(context);
 }));
 app.MapGet("/healthz", (HttpContext c) => Results.Ok(ApiSuccess.Create(new { status = "live" }, c.TraceIdentifier)));
-app.MapGet("/readyz", (HttpContext c, MongoFileStore store) => store.IsReady()
-    ? Results.Ok(ApiSuccess.Create(new { status = "ready", storage = "mongodb-gridfs" }, c.TraceIdentifier))
+app.MapGet("/readyz", (HttpContext c, MongoFileStore store, IngestionQueue queue) => store.IsReady()
+    ? Results.Ok(ApiSuccess.Create(new { status = "ready", storage = "mongodb-gridfs", ingestionQueueDepth = queue.Reader.Count }, c.TraceIdentifier))
     : Failure(c, 503, "SERVICE_UNAVAILABLE", "MongoDB is unavailable."));
 
 app.MapPost("/api/v1/materials", async (HttpContext c, [FromForm] IFormFile? file, [FromForm] string? displayName, [FromForm] string? subjectCode, IFileStore store) =>
@@ -101,7 +88,7 @@ app.MapGet("/api/v1/materials/{materialId}/extracted-text-preview", (string mate
     var document = store.GetExtractedText(materialId);
     return document is null ? Failure(c, 409, "MATERIAL_TEXT_NOT_READY", "Material text is not ready.") : Results.Ok(ApiSuccess.Create(document, c.TraceIdentifier));
 });
-app.MapDelete("/api/v1/materials/{materialId}", (string materialId, HttpContext c, IFileStore store) =>
+app.MapDelete("/api/v1/materials/{materialId}", async (string materialId, HttpContext c, IFileStore store) =>
 {
     var userId = GatewayUser(c, gatewayKey);
     if (userId is null) return Failure(c, 401, "AUTH_REQUIRED", "A gateway-authenticated user is required.");
@@ -112,17 +99,15 @@ var activeJob = store.GetLatestJob(materialId);
     if (activeJob?.EnableOcr == true && activeJob.Status is ("QUEUED" or "RUNNING"))
     {
         var ocrClient = c.RequestServices.GetRequiredService<IHttpClientFactory>().CreateClient("ocr");
-        _ = Task.Run(async () =>
+        try
         {
-            try
-            {
-                await ocrClient.PostAsync($"v1/ocr/jobs/{activeJob.JobId}/cancel", content: null, CancellationToken.None);
-            }
-            catch
-            {
-                // Deletion remains successful even if OCRService is already offline.
-            }
-        });
+            using var cancelTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            await ocrClient.PostAsync($"v1/ocr/jobs/{activeJob.JobId}/cancel", content: null, cancelTimeout.Token);
+        }
+        catch
+        {
+            // Deletion remains successful even if OCRService is offline or slow.
+        }
     }
     if (store.TryDelete(materialId, userId, out _)) return Results.NoContent();
 
@@ -143,7 +128,7 @@ app.MapPost("/api/v1/materials/{materialId}/ingestion-jobs", (string materialId,
     if (ocrMode is not ("quick" or "standard")) return Failure(c, 400, "VALIDATION_ERROR", "OCR mode must be quick or standard.");
     var job = store.CreateJob(materialId, string.IsNullOrWhiteSpace(request.ParserVersion) ? "files-text-v1" : request.ParserVersion, request.EnableOcr, ocrMode);
     if (job is null) return Failure(c, 409, "STATE_CONFLICT", "The material state changed before the ingestion job was created.");
-    _ = Task.Run(() => store.ProcessJobAsync(job.JobId, CancellationToken.None));
+    c.RequestServices.GetRequiredService<IngestionQueue>().Enqueue(job.JobId);
     return Results.Accepted($"/api/v1/ingestion-jobs/{job.JobId}", ApiSuccess.Create(job, c.TraceIdentifier));
 });
 app.MapGet("/api/v1/ingestion-jobs/{jobId}", async (string jobId, HttpContext c, IFileStore store, IHttpClientFactory httpClientFactory) =>

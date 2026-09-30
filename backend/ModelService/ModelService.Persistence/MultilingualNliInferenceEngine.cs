@@ -8,7 +8,7 @@ using ModelService.Domain;
 
 namespace ModelService.Persistence;
 
-public sealed class MultilingualNliInferenceEngine : IFacetInferenceEngine, IDisposable
+public sealed class MultilingualNliInferenceEngine : IFacetInferenceEngine, IInferenceLoadStats, IDisposable
 {
     public const string Version = "multilingual-minilmv2-l6-mnli-xnli@0a71e92a985b6e1ad1828cf67ce9c459639c1dca+strict-synonym-v1";
     private const int MaximumTokens = 512;
@@ -21,6 +21,15 @@ public sealed class MultilingualNliInferenceEngine : IFacetInferenceEngine, IDis
     private readonly double _minimumTopProbability;
     private readonly double _minimumMargin;
     private readonly Lazy<ModelRuntime?> _runtime;
+    /// <summary>同时进行的推理批次数上限，避免 ONNX CPU 被过多并发打满。</summary>
+    private readonly SemaphoreSlim _batchGate;
+    /// <summary>等待批次门的批次数上限；超出立即 503 + Retry-After，防止无限排队。</summary>
+    private readonly int _maxPendingBatches;
+    private readonly int _retryAfterSeconds;
+    private readonly int _facetParallelism;
+    private int _inflight;
+    private int _pending;
+    private long _completedBatches;
 
     public MultilingualNliInferenceEngine(
         ModelAssetCatalog assets,
@@ -33,10 +42,28 @@ public sealed class MultilingualNliInferenceEngine : IFacetInferenceEngine, IDis
             configuration.GetValue("Nli:MinimumTopProbability", 0.75d), 0d, 1d);
         _minimumMargin = Math.Clamp(
             configuration.GetValue("Nli:MinimumMargin", 0.20d), 0d, 1d);
+        var cores = Math.Max(1, Environment.ProcessorCount);
+        var maxBatches = Math.Clamp(
+            configuration.GetValue("Nli:MaxConcurrentBatches", Math.Max(1, cores / 2)),
+            1, cores);
+        _batchGate = new SemaphoreSlim(maxBatches, maxBatches);
+        _maxPendingBatches = Math.Clamp(
+            configuration.GetValue("Nli:MaxPendingBatches", 64), 1, 4096);
+        _retryAfterSeconds = Math.Clamp(
+            configuration.GetValue("Nli:RetryAfterSeconds", 2), 1, 60);
+        _facetParallelism = Math.Clamp(
+            configuration.GetValue("Nli:FacetParallelism", Math.Min(4, cores)),
+            1, 8);
         _runtime = new(CreateRuntime, LazyThreadSafetyMode.ExecutionAndPublication);
     }
 
-    public Task<FacetInferenceBatch> InferAsync(
+    public int InflightBatches => Volatile.Read(ref _inflight);
+    public long CompletedBatches => Interlocked.Read(ref _completedBatches);
+
+    /// <summary>已进入 InferAsync 但尚未获得批次门的批次数（排队深度）。</summary>
+    public int QueuedBatches => Math.Max(0, Volatile.Read(ref _pending) - Volatile.Read(ref _inflight));
+
+    public async Task<FacetInferenceBatch> InferAsync(
         string answer,
         IReadOnlyList<string> claims,
         CancellationToken cancellationToken)
@@ -44,23 +71,81 @@ public sealed class MultilingualNliInferenceEngine : IFacetInferenceEngine, IDis
         cancellationToken.ThrowIfCancellationRequested();
         var runtime = _runtime.Value;
         if (runtime is null)
-            return Task.FromResult(new FacetInferenceBatch(false, Version, [], "NLI_MODEL_UNAVAILABLE"));
+            return new FacetInferenceBatch(false, Version, [], "NLI_MODEL_UNAVAILABLE");
 
+        // 背压：排队深度超过上限时立即拒绝（503 + Retry-After），避免无限排队堆积
+        var pending = Interlocked.Increment(ref _pending);
+        if (pending > _maxPendingBatches)
+        {
+            Interlocked.Decrement(ref _pending);
+            throw new InferenceOverloadedException(_maxPendingBatches, _retryAfterSeconds);
+        }
+
+        Interlocked.Increment(ref _inflight);
         try
         {
-            var results = new InferenceFacet[claims.Count];
+            await _batchGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                // ONNX CPU 推理是同步阻塞：offload 到线程池，避免占用 ASP.NET 请求线程
+                var batch = await Task.Run(
+                    () => RunFacets(runtime, answer, claims, cancellationToken),
+                    cancellationToken).ConfigureAwait(false);
+                Interlocked.Increment(ref _completedBatches);
+                return batch;
+            }
+            finally
+            {
+                _batchGate.Release();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception error)
+        {
+            _logger.LogError(error, "NLI facet inference failed.");
+            return new FacetInferenceBatch(false, Version, [], "NLI_INFERENCE_FAILED");
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _inflight);
+            Interlocked.Decrement(ref _pending);
+        }
+    }
+
+    private FacetInferenceBatch RunFacets(
+        ModelRuntime runtime,
+        string answer,
+        IReadOnlyList<string> claims,
+        CancellationToken cancellationToken)
+    {
+        var results = new InferenceFacet[claims.Count];
+        if (claims.Count == 1 || _facetParallelism == 1)
+        {
             for (var index = 0; index < claims.Count; index++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 results[index] = Adjudicate(runtime, answer, claims[index]);
             }
-            return Task.FromResult(new FacetInferenceBatch(true, Version, results, null));
+            return new FacetInferenceBatch(true, Version, results, null);
         }
-        catch (Exception error) when (error is not OperationCanceledException)
-        {
-            _logger.LogError(error, "NLI facet inference failed.");
-            return Task.FromResult(new FacetInferenceBatch(false, Version, [], "NLI_INFERENCE_FAILED"));
-        }
+
+        // InferenceSession.Run 线程安全；facet 级有界并行降低单题延迟
+        Parallel.For(
+            0,
+            claims.Count,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = _facetParallelism,
+                CancellationToken = cancellationToken,
+            },
+            index =>
+            {
+                results[index] = Adjudicate(runtime, answer, claims[index]);
+            });
+        return new FacetInferenceBatch(true, Version, results, null);
     }
 
     private InferenceFacet Adjudicate(ModelRuntime runtime, string answer, string claim)
@@ -172,7 +257,21 @@ public sealed class MultilingualNliInferenceEngine : IFacetInferenceEngine, IDis
 
     public void Dispose()
     {
+        // 先占满批次门，尽量等待进行中的 Parallel.For/Session.Run 结束，再释放 session
+        try
+        {
+            var max = _batchGate.CurrentCount + _inflight;
+            for (var i = 0; i < Math.Max(1, max); i++)
+            {
+                if (!_batchGate.Wait(TimeSpan.FromMilliseconds(200))) break;
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            // ignore
+        }
         if (_runtime.IsValueCreated) _runtime.Value?.Session.Dispose();
+        _batchGate.Dispose();
     }
 
     private sealed record ModelRuntime(

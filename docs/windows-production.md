@@ -146,3 +146,21 @@ OCR 是可选服务，不由本脚本安装。需要 OCR 时，先运行 `backen
 ## 网络边界
 
 脚本将 Frontend、Gateway 和全部内部服务绑定到 `127.0.0.1`。Windows 防火墙只需允许 IIS/Nginx/Caddy 的 `80/443`，不要对公网放行 `5000`、`5101-5109`、`5120-5122`。
+
+## 与 Docker Compose 生产路径的关系
+
+仓库提供两条互斥的生产部署路径，按主机环境二选一，不要混用：
+
+| | 本脚本（原生 Windows） | `compose.production.yaml`（容器） |
+|---|---|---|
+| 适用环境 | Windows Server + IIS，MySQL/MongoDB/Neo4j 为 Windows 服务 | 已安装 Docker Compose 的 Linux/Windows 主机 |
+| 配置文件 | `.env.windows.production`（模板 `deploy/.env.windows.production.example`） | `.env`（模板 `.env.deploy.example`） |
+| 密钥门禁 | 脚本内置 `Assert-ProductionSettings`（拒绝 CHANGE_ME 与默认密钥） | `${VAR:?}` 解析期强制 + `scripts/Test-ProductionEnv.ps1` |
+| 管理员身份 | `GALREVIEW_ADMIN_PRINCIPAL_ID`（首次初始化自动生成 GUID） | `GALREVIEW_ADMIN_PRINCIPAL_ID`（`${VAR:?}` 必填） |
+| 详细文档 | 本文 | `docs/deploy.md`「生产叠加层」 |
+
+两条路径的服务密钥、管理员身份语义完全一致：AuthService 与 CreditService 通过
+`Admin__PrincipalId` 读到同一个管理员 GUID；缺失时服务在生产环境会启动失败（fail-fast）。
+容器路径禁止叠加 Mock 默认值；原生路径由 `Assert-ProductionSettings` 拒绝 `MOONSTONE_MODE=Mock`
+以外的不安全默认（密钥类）。`deploy-windows.ps1` 不调用 Docker，也不会读取
+`compose.production.yaml`；反之容器路径不使用 `.env.windows.production`。

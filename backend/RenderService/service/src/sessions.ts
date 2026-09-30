@@ -22,6 +22,12 @@ import type {
 } from './contract.js'
 import { isNonEmptyString, isRecord, isUuidV4 } from './contract.js'
 import type { GatewayClient, UpstreamFailure } from './gateway-client.js'
+import {
+  loadFileSnapshot,
+  saveFileSnapshot,
+  type PersistedSessionRecord,
+  type FileSnapshot,
+} from './sessionStore.js'
 
 export const SESSION_LIMITS = Object.freeze({
   maxAnswerResults: 100,
@@ -101,6 +107,81 @@ export interface SessionServiceOptions {
   gateway: GatewayClient
   now?: () => Date
   newId?: () => string
+  /** 可选：文件快照路径。设置后重启可恢复会话（单实例）。 */
+  persistPath?: string | null
+}
+
+function serializeRecord(record: SessionRecord): PersistedSessionRecord {
+  const questions: Record<string, PersistedSessionRecord['digest']['questions'][string]> = {}
+  for (const [questionId, digest] of record.digest.questions) {
+    questions[questionId] = {
+      knowledgePointId: digest.knowledgePointId,
+      sceneId: digest.sceneId,
+      choices: Object.fromEntries(digest.choices),
+    }
+  }
+  return {
+    sessionId: record.sessionId,
+    userId: record.userId,
+    packageId: record.packageId,
+    reviewPlanId: record.reviewPlanId,
+    snapshotVersion: record.snapshotVersion,
+    clientRuntimeVersion: record.clientRuntimeVersion,
+    status: record.status,
+    currentSceneId: record.currentSceneId,
+    progressVersion: record.progressVersion,
+    startedAt: record.startedAt,
+    completedAt: record.completedAt,
+    createdAt: record.createdAt,
+    digest: {
+      entrySceneId: record.digest.entrySceneId,
+      sceneIds: [...record.digest.sceneIds],
+      questions,
+      hasQuestions: record.digest.hasQuestions,
+    },
+    snapshot: record.snapshot,
+    snapshotChecksum: record.snapshotChecksum,
+    eventIds: [...record.eventIds],
+    result: record.result,
+    pendingResult: record.pendingResult,
+  }
+}
+
+function deserializeRecord(raw: PersistedSessionRecord): SessionRecord {
+  const sceneIds = new Set(raw.digest.sceneIds)
+  const questions = new Map<string, QuestionDigest>()
+  for (const [questionId, q] of Object.entries(raw.digest.questions ?? {})) {
+    questions.set(questionId, {
+      knowledgePointId: q.knowledgePointId,
+      sceneId: q.sceneId,
+      choices: new Map(Object.entries(q.choices ?? {})),
+    })
+  }
+  return {
+    sessionId: raw.sessionId,
+    userId: raw.userId,
+    packageId: raw.packageId,
+    reviewPlanId: raw.reviewPlanId,
+    snapshotVersion: raw.snapshotVersion,
+    clientRuntimeVersion: raw.clientRuntimeVersion,
+    status: raw.status as ReviewSessionStatus,
+    currentSceneId: raw.currentSceneId,
+    progressVersion: raw.progressVersion,
+    startedAt: raw.startedAt,
+    completedAt: raw.completedAt,
+    createdAt: raw.createdAt,
+    digest: {
+      entrySceneId: raw.digest.entrySceneId,
+      sceneIds,
+      questions,
+      hasQuestions: raw.digest.hasQuestions,
+    },
+    snapshot: (raw.snapshot ?? null) as ProgressSnapshot | null,
+    snapshotChecksum: raw.snapshotChecksum,
+    eventIds: new Set(raw.eventIds ?? []),
+    result: (raw.result ?? null) as SessionRecord['result'],
+    pendingResult: (raw.pendingResult ?? null) as SessionRecord['pendingResult'],
+  }
 }
 
 function failure(
@@ -180,14 +261,49 @@ export interface SessionService {
   submitResult(input: {
     userId: string; sessionId: string; body: unknown; correlationId?: string
   }): Promise<DomainResult<ReviewResult>>
-  stats(): { sessions: number; storage: 'ephemeral-memory' }
+  stats(): { sessions: number; storage: 'ephemeral-memory' | 'file' }
 }
 
 export function createSessionService(options: SessionServiceOptions): SessionService {
   const { gateway } = options
   const now = options.now ?? (() => new Date())
   const newId = options.newId ?? randomUUID
+  const persistPath = options.persistPath?.trim() || null
   const sessions = new Map<string, SessionRecord>()
+
+  if (persistPath) {
+    const snapshot = loadFileSnapshot(persistPath)
+    if (snapshot) {
+      for (const raw of snapshot.sessions) {
+        try {
+          sessions.set(raw.sessionId, deserializeRecord(raw))
+        } catch {
+          // Skip corrupt rows rather than failing boot.
+        }
+      }
+    }
+  }
+
+  let persistTimer: ReturnType<typeof setTimeout> | null = null
+  function schedulePersist(): void {
+    if (!persistPath) return
+    if (persistTimer) return
+    persistTimer = setTimeout(() => {
+      persistTimer = null
+      try {
+        const payload: FileSnapshot = {
+          version: 1,
+          savedAt: now().toISOString(),
+          sessions: [...sessions.values()].map(serializeRecord),
+        }
+        saveFileSnapshot(persistPath, payload)
+      } catch {
+        // Persistence is best-effort; in-memory remains authoritative for this process.
+      }
+    }, 250)
+    // Do not keep the process alive solely for a pending snapshot.
+    persistTimer.unref?.()
+  }
 
   function findOwned(sessionId: string, userId: string): SessionRecord | null {
     const record = sessions.get(sessionId)
@@ -259,6 +375,7 @@ export function createSessionService(options: SessionServiceOptions): SessionSer
         pendingResult: null,
       }
       sessions.set(record.sessionId, record)
+      schedulePersist()
       return { ok: true, status: 201, body: sessionView(record) }
     },
 
@@ -338,6 +455,7 @@ export function createSessionService(options: SessionServiceOptions): SessionSer
         savedAt: now().toISOString(),
       }
       record.snapshotChecksum = inputChecksum
+      schedulePersist()
       return { ok: true, status: 200, body: record.snapshot }
     },
 
@@ -386,7 +504,10 @@ export function createSessionService(options: SessionServiceOptions): SessionSer
           accepted += 1
         }
       }
-      if (accepted > 0) markRunning(record)
+      if (accepted > 0) {
+        markRunning(record)
+        schedulePersist()
+      }
       return { ok: true, status: 202, body: { accepted, duplicates } }
     },
 
@@ -627,6 +748,7 @@ export function createSessionService(options: SessionServiceOptions): SessionSer
         submittedAt,
       }
       record.pendingResult = null
+      schedulePersist()
 
       return {
         ok: true,
@@ -637,7 +759,10 @@ export function createSessionService(options: SessionServiceOptions): SessionSer
 
     // Diagnostics for /readyz and tests.
     stats() {
-      return { sessions: sessions.size, storage: 'ephemeral-memory' }
+      return {
+        sessions: sessions.size,
+        storage: persistPath ? ('file' as const) : ('ephemeral-memory' as const),
+      }
     },
   }
 }

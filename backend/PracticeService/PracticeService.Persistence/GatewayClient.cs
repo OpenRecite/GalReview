@@ -122,7 +122,10 @@ public sealed class GatewayClient(IHttpClientFactory clients, IConfiguration con
     }
     private HttpRequestMessage Create(HttpMethod method, string path)
     {
-        var request = new HttpRequestMessage(method, path); request.Headers.TryAddWithoutValidation("X-Service-Name", ServiceName); request.Headers.TryAddWithoutValidation("X-Service-Key", ServiceKey); return request;
+        var request = new HttpRequestMessage(method, path); request.Headers.TryAddWithoutValidation("X-Service-Name", ServiceName); request.Headers.TryAddWithoutValidation("X-Service-Key", ServiceKey);
+        // 跨服务透传：缺省取请求级 TraceFlow，后台任务未设置时生成新 id
+        request.Headers.TryAddWithoutValidation("X-Correlation-Id", TraceFlow.Current ?? Guid.NewGuid().ToString("N"));
+        return request;
     }
     private PracticeDomainException Failure(System.Net.HttpStatusCode status, string body, string fallback)
     {

@@ -214,6 +214,22 @@ public sealed class MongoFileStore : IFileStore
     }
     public IngestionJob? GetJob(string jobId) => _jobs.Find(x => x.JobId == jobId).FirstOrDefault();
     public IngestionJob? GetLatestJob(string materialId) => _jobs.Find(x => x.MaterialId == materialId).SortByDescending(x => x.CreatedAt).FirstOrDefault();
+
+    public bool TryRequeueForRetry(string jobId, int maxAttempts)
+    {
+        var updated = _jobs.FindOneAndUpdate(
+            candidate => candidate.JobId == jobId
+                && candidate.Status == "FAILED"
+                && candidate.AttemptCount < maxAttempts,
+            Builders<IngestionJob>.Update
+                .Set(candidate => candidate.Status, "QUEUED")
+                .Set(candidate => candidate.Progress, 0)
+                .Set(candidate => candidate.Error, null)
+                .Inc(candidate => candidate.AttemptCount, 1)
+                .Set(candidate => candidate.UpdatedAt, DateTimeOffset.UtcNow),
+            new FindOneAndUpdateOptions<IngestionJob> { ReturnDocument = ReturnDocument.After });
+        return updated is not null;
+    }
     public IngestionJob? CreateJob(string materialId, string parserVersion, bool enableOcr, string ocrMode)
     {
         var stored = FindMaterial(materialId);
