@@ -22,6 +22,9 @@ public sealed class IngestionQueue
     public IAsyncEnumerable<string> ReadAllAsync(CancellationToken cancellationToken) =>
         _channel.Reader.ReadAllAsync(cancellationToken);
 
+    /// <summary>当前排队任务数；无界通道不支持 Count，返回 -1 表示未知。</summary>
+    public int Depth => _channel.Reader.CanCount ? _channel.Reader.Count : -1;
+
     /// <summary>底层读取端：Worker 用它做 TryRead / WaitToReadAsync 的重试调度。</summary>
     public System.Threading.Channels.ChannelReader<string> Reader => _channel.Reader;
 

@@ -47,7 +47,7 @@ app.UseExceptionHandler(error => error.Run(context =>
 }));
 app.MapGet("/healthz", (HttpContext c) => Results.Ok(ApiSuccess.Create(new { status = "live" }, c.TraceIdentifier)));
 app.MapGet("/readyz", (HttpContext c, MongoFileStore store, IngestionQueue queue) => store.IsReady()
-    ? Results.Ok(ApiSuccess.Create(new { status = "ready", storage = "mongodb-gridfs", ingestionQueueDepth = queue.Reader.Count }, c.TraceIdentifier))
+    ? Results.Ok(ApiSuccess.Create(new { status = "ready", storage = "mongodb-gridfs", ingestionQueueDepth = queue.Depth }, c.TraceIdentifier))
     : Failure(c, 503, "SERVICE_UNAVAILABLE", "MongoDB is unavailable."));
 
 app.MapPost("/api/v1/materials", async (HttpContext c, [FromForm] IFormFile? file, [FromForm] string? displayName, [FromForm] string? subjectCode, IFileStore store) =>
